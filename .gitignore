@@ -1,0 +1,33 @@
+# Arquivos gerados pela extração
+*.csv
+MUTDFC_log_*.txt
+
+# Pasta de trabalho padrão (caso criada dentro do repo)
+MUTDFC_Extracao/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+.env/
+
+# Editores / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
