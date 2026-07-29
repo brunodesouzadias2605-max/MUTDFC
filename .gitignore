@@ -1,0 +1,24 @@
+# Arquivos gerados pela automação — não rastrear no Git
+
+# CSVs diários extraídos do SAP
+*.csv
+
+# Arquivo consolidado
+Consolidado_*.csv
+
+# Arquivos de LOG
+*.txt
+MUTDFC_log_*.txt
+
+# Pasta de trabalho padrão (se criada dentro do repositório)
+Extrações/
+Extracoes/
+
+# Artefatos do Windows
+Thumbs.db
+desktop.ini
+
+# Editor e IDE
+.vscode/
+*.suo
+*.user
