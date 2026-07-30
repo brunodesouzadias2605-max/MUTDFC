@@ -62,6 +62,8 @@ As tabelas são validadas por:
 - existência de arquivo;
 - cabeçalho esperado;
 - quantidade de linhas de dados > 0.
+- colunas obrigatórias da ZCO059 (`Empresa | Divisão | Consolida`) e rejeição do
+  export incorreto com descrições como `SPE Controlada | S | SIM`.
 
 Destino padronizado (derivado automaticamente de `os.path.abspath(__file__)`):
 
@@ -88,14 +90,18 @@ Destino padronizado (derivado automaticamente de `os.path.abspath(__file__)`):
 1. Navegar para `zco059` via campo de comando.
 2. Aguardar ALV grid em `subSUB_DRE:ZCOR043:0100/cntlCCONTAINER_1/shellcont/shell`.
 3. `pressToolbarButton "&COL0"` para abrir seleção de colunas.
-4. Sequência de `btnAPP_FL_SING.press` com `currentCellRow` conforme VBS (11 pressionamentos).
-5. `btn[0]` para confirmar seleção de colunas.
+4. A seleção de colunas do ALV é **obrigatória** e replica o VBS com esperas entre
+   cada passo do popup (`btnAPP_FL_SING` + `currentCellRow = 1`, `2`, sete presses
+   adicionais, `currentCellRow = 3` e `btn[0]` para confirmar).
+5. Se a seleção falhar após 3 tentativas, a importação é abortada com erro claro
+   orientando a exportar via `ZCO059.vbs` e usar a opção de importar por arquivo.
 6. `setCurrentCell(-1, "CONSOLIDA")` + `selectColumn("CONSOLIDA")`.
 7. `pressToolbarContextButton "&MB_FILTER"` + `selectContextMenuItem "&FILTER"`.
 8. Preencher `%%DYN001-LOW = "S"` e confirmar com `btn[0]`.
 9. `pressToolbarContextButton "&MB_EXPORT"` + `selectContextMenuItem "&PC"`.
 10. `btn[0]` para confirmar tipo de exportação.
-11. Preencher `DY_PATH` e `DY_FILENAME = ZCO059.csv`; salvar com `btn[11]`.
+11. Preencher `DY_PATH = <pasta do projeto>/saidas/tabelas`; o arquivo é validado
+    antes de ser renomeado para `ZCO059.csv`.
 
 ### Robustez contra o erro 619
 
@@ -111,7 +117,10 @@ o sistema lê o CSV com o parser de largura fixa (`|`) incluindo:
 
 - correção de mojibake (`Divis\xef\xbf\xbd\xef\xbf\xbdo` → `Divisão`);
 - ignora linhas de título, separadores e rodapé SAP;
-- valida cabeçalho e volume mínimo de dados antes de aceitar o arquivo.
+- aceita tanto o formato largura-fixa do VBS quanto o CSV simples normalizado;
+- valida `Divisão` (alfanumérica curta) e `Consolida` (`S`, `N` ou vazio);
+- rejeita explicitamente o arquivo incorreto sem seleção de colunas do ALV,
+  exibindo erro claro para refazer a exportação.
 
 ---
 
