@@ -12,8 +12,8 @@ gera um resumo por categoria — tudo via menu no terminal.
 | Opção | Ação |
 |-------|------|
 | **1 — Extrair + Consolidar** | Executa a FBL3N para cada dia/semana/mês do período, exporta um CSV por iteração, depois consolida tudo em um único arquivo limpo e ordenado. |
-| **2 — Classificar** | Lê um consolidado existente e gera um arquivo classificado com a coluna `Classificação` adicionada (IOF, IRRF, Rendimento, Adições ou Baixas). |
-| **3 — Resumo** | Lê um arquivo classificado e gera totais de `Montante Razão` por classificação, exibindo no terminal, no LOG e gravando em arquivo. |
+| **2 — Classificar** | Lê um consolidado existente e gera um arquivo classificado com a coluna `Classificação` adicionada (somente linhas de Mútuo `1202*`). |
+| **3 — Resumo** | Lê um arquivo classificado e gera totais de `Montante Razão` por classificação, exibindo no terminal, no LOG e gravando em CSV e Excel. |
 | **4 — Executar tudo** | Executa as opções 1, 2 e 3 em sequência. |
 | **0 — Sair** | Encerra o programa. |
 
@@ -28,6 +28,7 @@ gera um resumo por categoria — tudo via menu no terminal.
 | **Usuário logado** | O script apenas **anexa** à sessão existente; não faz login. |
 | **Python 3.8+** | Baixe em [python.org](https://www.python.org/downloads/). |
 | **pywin32** | `pip install -r requirements.txt` |
+| **openpyxl** | Incluído no `requirements.txt`; usado para geração do Excel de resumo. |
 
 ### Habilitar SAP GUI Scripting
 
@@ -95,8 +96,13 @@ Opção: 1
 
 ### Classificar / Resumo (opções 2, 3)
 
-O script exibe o caminho do último arquivo encontrado como sugestão; pressione
-Enter para aceitá-lo ou informe outro caminho.
+O script exibe o nome do último arquivo encontrado como sugestão; pressione
+Enter para aceitá-lo ou informe outro nome/caminho.
+
+- Pode digitar apenas o nome do arquivo (com ou sem `.csv`); o script
+  procurará automaticamente na pasta `saidas/consolidado`.
+- Se informar um caminho absoluto, será usado diretamente.
+- A extensão `.csv` é adicionada automaticamente se omitida.
 
 ---
 
@@ -111,55 +117,99 @@ causavam o erro 617 *"The virtual key is not enabled"* na versão anterior).
 
 ---
 
+## Contas de referência para classificação
+
+| Constante | Conta | Descrição |
+|-----------|-------|-----------|
+| `CONTA_IOF` | `2104030007` | IOF sobre operação de Mútuo |
+| `CONTA_IRRF` | `1103050050` | IRRF sobre rendimento de Mútuo |
+| `CONTA_JUROS` | `4401020004` | Receita de juros de Mútuo |
+| `PREFIXO_MUTUO` | `1202*` | Contas de Mútuo (todas que iniciam com `1202`) |
+
+> Para corrigir ou atualizar os números de conta, altere apenas as
+> constantes `CONTA_IOF`, `CONTA_IRRF` e `CONTA_JUROS` no topo de
+> `mutdfc.py`.
+
+---
+
 ## Regras de classificação
 
-A classificação se aplica às **linhas de Mútuo** (conta iniciando com `1202`)
-e às linhas das contas especiais abaixo.
+A classificação se aplica **exclusivamente** às linhas de Mútuo
+(conta iniciando com `1202`). As linhas de contrapartida (IOF/IRRF/Juros)
+**não** recebem classificação e **não** entram nos totais do resumo — servem
+apenas como referência de vínculo para evitar dupla contagem.
 
-| Classificação | Critério |
-|---------------|----------|
-| **IOF** | O mesmo `Nº doc.` aparece na conta `2104030007`. |
-| **IRRF** | O mesmo `Nº doc.` aparece na conta `1103050010`. |
-| **Rendimento** | O mesmo `Nº doc.` aparece na conta `4401030001`. |
-| **Adições** | Linha de Mútuo sem vínculo especial, com Montante Razão positivo (débito). |
-| **Baixas** | Linha de Mútuo sem vínculo especial, com Montante Razão negativo (crédito). |
+| Prioridade | Critério | Classificação |
+|------------|----------|---------------|
+| 1 | O mesmo `Nº doc.` aparece na conta `2104030007` | **IOF** |
+| 2 | O mesmo `Nº doc.` aparece na conta `1103050050` | **IRRF** |
+| 3 | O mesmo `Nº doc.` aparece na conta `4401020004` | **Juros** |
+| 4a | Nenhum vínculo especial e `CL == 09` | **Adições** |
+| 4b | Nenhum vínculo especial e `CL == 19` | **Baixa** |
+| — | `CL` com valor diferente de `09`/`19` | *(sem classificação — logado)* |
 
-> **Heurística Adições/Baixas**: a função `classificar_natureza()` usa o sinal
-> do campo `Montante Razão` — positivo = Adições, negativo = Baixas. Essa é
-> uma convenção baseada no comportamento típico do FBL3N; se a lógica de
-> negócio exigir outra interpretação, ajuste os retornos dessa função no topo
-> do arquivo `mutdfc.py`.
-
-As linhas das contas IOF/IRRF/Rendimento também recebem a classificação
-correspondente, facilitando a totalização no Resumo.
+> A coluna `CL` é lida de forma robusta: `'9'` é tratado como `'09'`.
+> Linhas de Mútuo com `CL` desconhecido ficam sem classificação e são
+> registradas no LOG para diagnóstico.
 
 ---
 
 ## Resumo
 
-O resumo agrupa `Montante Razão` (parse no formato BR: `1.234,56`) por
-`Classificação` e exibe:
-- Contagem de lançamentos por categoria.
-- Total de montante por categoria.
-- Total geral.
+O resumo agrupa `Montante Razão` por `Classificação`, considerando **apenas**
+as 5 categorias abaixo, **nesta ordem**:
+
+```
+Adições
+Juros
+IOF
+IRRF
+Baixa
+```
+
+Para cada categoria: contagem de lançamentos e total de montante.
+Inclui linha de **TOTAL GERAL** ao final.
 
 Exemplo de saída no terminal:
 
 ```
-------------------------------------------------------------
+--------------------------------------------------------------
   RESUMO — Classificado_01.06.2026_a_30.06.2026.csv
-------------------------------------------------------------
-  Classificação             Lançamentos     Total Montante
-------------------------------------------------------------
-  Adições                           120       1.500.000,00
-  Baixas                             45        -300.000,00
-  IOF                                10         -15.000,00
-  IRRF                                8          -8.000,00
-  Rendimento                         12          40.000,00
-------------------------------------------------------------
-  TOTAL GERAL                       195       1.217.000,00
-------------------------------------------------------------
+--------------------------------------------------------------
+  Classificação         Lançamentos       Total Montante
+--------------------------------------------------------------
+  Adições                       120         1.500.000,00
+  Juros                          12            40.000,00
+  IOF                            10           15.000,00-
+  IRRF                            8            8.000,00-
+  Baixa                          45          300.000,00-
+--------------------------------------------------------------
+  TOTAL GERAL                   195         1.217.000,00
+--------------------------------------------------------------
 ```
+
+### Saídas geradas
+
+| Arquivo | Descrição |
+|---------|-----------|
+| `Resumo_<ini>_a_<fim>.csv` | CSV em UTF-8 com BOM (`utf-8-sig`) |
+| `Resumo_<ini>_a_<fim>.xlsx` | Excel com cabeçalho em negrito, larguras ajustadas e formato numérico contábil |
+
+---
+
+## Correção de encoding
+
+Os CSVs exportados pelo SAP podem vir em encodings diferentes. O script usa
+a função `ler_csv_corrigindo_encoding()` que:
+
+1. Tenta `utf-8-sig` / `utf-8` primeiro.
+2. Se falhar ou detectar padrões de mojibake (`Ã§`, `Ã£`, `Ãµ` etc.),
+   tenta `cp1252` / `latin-1` e corrige via `encode('latin-1').decode('utf-8')`.
+3. Loga o encoding detectado e se houve correção por arquivo.
+
+Todas as saídas (consolidado, classificado, resumo CSV) são gravadas em
+**`utf-8-sig`** com acentos corretos (`Razão`, `Nº doc.`, `Dt.Lçto`,
+`Classificação`, `Adições`, `Mútuo`, `Correção`).
 
 ---
 
@@ -175,6 +225,9 @@ Abra `mutdfc.py` e ajuste as **CONSTANTES** no topo do arquivo:
 | `PASTA_LOGS` | `logs/` | Onde os arquivos de LOG são gravados. |
 | `CONTA_LAYOUT` | `MUTDFC` | Variante de layout da FBL3N. |
 | `USUARIO_SAP` | `MS0000240` | Usuário SAP dono da variante. |
+| `CONTA_IOF` | `2104030007` | Conta de IOF. |
+| `CONTA_IRRF` | `1103050050` | Conta de IRRF. |
+| `CONTA_JUROS` | `4401020004` | Conta de receita de juros. |
 | `SISTEMAS` | _(dict)_ | Descrições e palavras-chave das conexões. |
 
 ---
@@ -207,7 +260,8 @@ MUTDFC/
 │   └── consolidado/
 │       ├── Consolidado_01.06.2026_a_30.06.2026.csv
 │       ├── Classificado_01.06.2026_a_30.06.2026.csv
-│       └── Resumo_01.06.2026_a_30.06.2026.csv
+│       ├── Resumo_01.06.2026_a_30.06.2026.csv
+│       └── Resumo_01.06.2026_a_30.06.2026.xlsx
 └── logs/
     └── MUTDFC_log_20260630_143000.txt
 ```
@@ -223,8 +277,11 @@ O arquivo `MUTDFC_log_<timestamp>.txt` registra:
 - Parâmetros informados no menu.
 - Início/fim de cada extração (com data e caminho do CSV).
 - Dias sem partidas (`INFO`: "Dia DD.MM.AAAA sem partidas — nenhum dado a exportar.").
+- Encoding detectado por arquivo (e se houve correção de mojibake).
 - Erros COM do SAP GUI Scripting (passo, mensagem, contexto).
-- Contagens de classificação por categoria.
+- Contagens de classificação por categoria (linhas Mútuo).
+- Linhas de Mútuo sem classificação (valor de CL desconhecido).
+- Quantidade de linhas não-Mútuo ignoradas na classificação.
 - Resumo completo por classificação.
 - Caminho de todos os arquivos gerados.
 
@@ -249,6 +306,7 @@ MUTDFC/
 | Pacote | Uso |
 |--------|-----|
 | `pywin32` | Acesso ao SAP GUI Scripting via COM (`win32com.client`) |
+| `openpyxl` | Geração do arquivo Excel de resumo (`.xlsx`) |
 
 Bibliotecas da stdlib usadas: `os`, `glob`, `re`, `logging`, `datetime`,
 `calendar`, `sys`.
