@@ -3,7 +3,8 @@ mutdfc.py — MUTDFC: Movimentação do Fluxo de Caixa (contas de Mútuo)
 
 Extrai o Razão Contábil (FBL3N) referente a Mútuo via SAP GUI Scripting
 (COM / pywin32), consolida os arquivos diários em um único CSV (limpo e
-ordenado), classifica as linhas de Mútuo e gera resumo por categoria.
+ordenado), classifica as linhas de Mútuo, cruza consolidação intercompany
+(ZFIT009/ZCO059), separa contrapartidas e gera resumo em estrutura de fluxo.
 
 Pré-requisitos:
   - Windows com SAP GUI instalado e SAP GUI Scripting habilitado.
@@ -18,11 +19,14 @@ Como alterar configurações:
 
 import calendar
 import glob
+import json
 import logging
 import os
 import re
 import sys
+from collections import defaultdict
 from datetime import datetime, timedelta
+from getpass import getuser
 
 # ---------------------------------------------------------------------------
 # CONSTANTES DE CONFIGURAÇÃO — altere aqui conforme o seu ambiente
@@ -36,7 +40,9 @@ PASTA_BASE = os.path.dirname(os.path.abspath(__file__))
 # Subpastas de saída (criadas automaticamente)
 PASTA_DIARIOS     = os.path.join(PASTA_BASE, "saidas", "diarios")
 PASTA_CONSOLIDADO = os.path.join(PASTA_BASE, "saidas", "consolidado")
+PASTA_TABELAS     = os.path.join(PASTA_BASE, "saidas", "tabelas")
 PASTA_LOGS        = os.path.join(PASTA_BASE, "logs")
+ARQUIVO_SALDO_INICIAL = os.path.join(PASTA_BASE, "saldo_inicial.json")
 
 # Variante de layout salva no SAP (campo txtV-LOW da tela de seleção de layout)
 CONTA_LAYOUT = "MUTDFC"
@@ -107,6 +113,21 @@ CONTAS_CLASSIFICACAO = {
 
 # Prefixo das contas de Mútuo
 PREFIXO_MUTUO = "1202"
+
+# Contas de contrapartida movidas para auditoria após classificação
+CONTAS_CONTRAPARTIDA_AUDITORIA = {CONTA_JUROS, CONTA_IRRF, CONTA_IOF}
+
+# Ordem fixa do resumo em estrutura de fluxo
+_ORDEM_FLUXO = [
+    "Saldo Inicial",
+    "Adições",
+    "(-) Eliminações",
+    "Juros",
+    "IOF",
+    "IRRF",
+    "Baixas",
+    "Saldo Final",
+]
 
 # Sentinel retornado por extrair_razao() quando o dia não tem partidas.
 # Distingue "sem dados" (fluxo normal) de None (falha/erro).
@@ -288,6 +309,34 @@ def _parse_montante(valor_str: str):
         valor = float(limpo)
         return -valor if negativo else valor
     except (ValueError, AttributeError):
+        return None
+
+
+def _formatar_valor_br(valor: float) -> str:
+    """Formata float no padrão brasileiro com negativo à direita."""
+    abs_v = abs(valor)
+    s = f"{abs_v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{s}-" if valor < 0 else s
+
+
+def _parse_numero_br(valor_str: str):
+    """Converte texto numérico BR para float (aceita negativo à esquerda/direita)."""
+    if valor_str is None:
+        return None
+    s = str(valor_str).strip()
+    if not s:
+        return None
+    negativo = s.endswith("-")
+    if negativo:
+        s = s[:-1].strip()
+    if s.startswith("-"):
+        negativo = True
+        s = s[1:].strip()
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        valor = float(s)
+        return -valor if negativo else valor
+    except ValueError:
         return None
 
 
@@ -894,6 +943,696 @@ def classificar(
 
 
 # ---------------------------------------------------------------------------
+# TABELAS DE CONSOLIDAÇÃO INTERCOMPANY (ZFIT009 / ZCO059)
+# ---------------------------------------------------------------------------
+
+def _linha_pipe_separador(partes: list) -> bool:
+    """Retorna True quando a linha é composta apenas por hífens/separadores."""
+    if not partes:
+        return True
+    com_conteudo = [p for p in partes if p.strip()]
+    if not com_conteudo:
+        return True
+    return all(not p.strip().replace("-", "").strip() for p in com_conteudo)
+
+
+def parse_tabela_pipe(caminho: str, tipo: str, logger: logging.Logger) -> tuple:
+    """
+    Faz parse robusto de tabela SAP largura-fixa delimitada por '|'.
+
+    Retorna (registros, cabecalho_encontrado).
+    - tipo='zfit009' → [{'Cliente': '2200000404', 'Divisão': 'A001'}, ...]
+    - tipo='zco059'  → [{'Empresa': 'MRVH', 'Divisão': 'A001', 'Consolida': 'S'}, ...]
+    """
+    registros = []
+    cabecalho_encontrado = False
+
+    for linha in ler_csv_corrigindo_encoding(caminho, logger):
+        texto = linha.strip()
+        if not texto:
+            continue
+
+        if texto.startswith("|"):
+            partes = [p.strip() for p in linha.split("|")[1:-1]]
+        elif "|" in texto:
+            partes = [p.strip() for p in linha.split("|")]
+        else:
+            continue
+
+        if _linha_pipe_separador(partes):
+            continue
+
+        linha_norm = linha.upper()
+        if tipo == "zfit009":
+            if "CLIENTE" in linha_norm and ("DIVIS" in linha_norm or "DIVISÃ" in linha_norm):
+                cabecalho_encontrado = True
+                continue
+            if len(partes) < 2:
+                continue
+            cliente = partes[-2].strip()
+            divisao = partes[-1].strip()
+            if not re.fullmatch(r"\d{10}", cliente):
+                continue
+            registros.append({"Cliente": cliente, "Divisão": divisao})
+        elif tipo == "zco059":
+            if "EMPRESA" in linha_norm and ("DIVIS" in linha_norm or "DIVISÃ" in linha_norm):
+                cabecalho_encontrado = True
+                continue
+            if len(partes) < 3:
+                continue
+            empresa = partes[-3].strip()
+            divisao = partes[-2].strip()
+            consolida = partes[-1].strip().upper()
+            if not empresa and not divisao and not consolida:
+                continue
+            registros.append(
+                {"Empresa": empresa, "Divisão": divisao, "Consolida": consolida}
+            )
+
+    return registros, cabecalho_encontrado
+
+
+def _validar_importacao_tabela(
+    caminho: str, tipo: str, registros: list, cabecalho_encontrado: bool, logger: logging.Logger
+) -> bool:
+    """Valida existência, cabeçalho e volume de dados importados."""
+    if not os.path.isfile(caminho):
+        logger.error("Arquivo %s não encontrado: '%s'", tipo.upper(), caminho)
+        return False
+    if not cabecalho_encontrado:
+        logger.error("Cabeçalho esperado não encontrado em '%s' (%s).", caminho, tipo.upper())
+        return False
+    if len(registros) == 0:
+        logger.error("Nenhuma linha de dados válida encontrada em '%s' (%s).", caminho, tipo.upper())
+        return False
+    logger.info(
+        "Importação %s validada com sucesso: %d linha(s) de dados.",
+        tipo.upper(),
+        len(registros),
+    )
+    return True
+
+
+def _salvar_tabela_normalizada(tipo: str, registros: list, pasta_tabelas: str, logger: logging.Logger) -> str:
+    """Salva tabela tratada em UTF-8-SIG na pasta de tabelas do projeto."""
+    os.makedirs(pasta_tabelas, exist_ok=True)
+    nome = "ZFIT009.csv" if tipo == "zfit009" else "ZCO059.csv"
+    caminho = os.path.join(pasta_tabelas, nome)
+
+    with open(caminho, "w", encoding="utf-8-sig", newline="") as f:
+        if tipo == "zfit009":
+            f.write("Cliente|Divisão\n")
+            for item in registros:
+                f.write(f"{item['Cliente']}|{item['Divisão']}\n")
+        else:
+            f.write("Empresa|Divisão|Consolida\n")
+            for item in registros:
+                f.write(f"{item['Empresa']}|{item['Divisão']}|{item['Consolida']}\n")
+
+    logger.info("Tabela %s salva em '%s'.", tipo.upper(), caminho)
+    return caminho
+
+
+def importar_tabela_de_arquivo(caminho_origem: str, tipo: str, pasta_tabelas: str, logger: logging.Logger):
+    """Importa ZFIT009/ZCO059 a partir de arquivo já exportado manualmente."""
+    registros, cabecalho_encontrado = parse_tabela_pipe(caminho_origem, tipo, logger)
+    if not _validar_importacao_tabela(caminho_origem, tipo, registros, cabecalho_encontrado, logger):
+        return None
+    return _salvar_tabela_normalizada(tipo, registros, pasta_tabelas, logger)
+
+
+def importar_zfit009_sap(session, pasta_tabelas: str, logger: logging.Logger):
+    """
+    Importa ZFIT009 via SAP GUI Scripting (SE16) e salva em saidas/tabelas/ZFIT009.csv.
+    """
+    os.makedirs(pasta_tabelas, exist_ok=True)
+    caminho = os.path.join(pasta_tabelas, "ZFIT009.csv")
+    try:
+        session.findById("wnd[0]/tbar[0]/okcd").Text = "se16"
+        session.findById("wnd[0]").sendVKey(0)
+        session.findById("wnd[0]/usr/ctxtDATABROWSE-TABLENAME").Text = "ZFIT009"
+        session.findById("wnd[0]").sendVKey(0)
+        session.findById("wnd[0]").sendVKey(14)
+        session.findById("wnd[1]/usr/chk[1,5]").Selected = True
+        session.findById("wnd[1]/usr/chk[1,11]").Selected = True
+        session.findById("wnd[1]").sendVKey(8)
+        session.findById("wnd[0]/mbar/menu[6]/menu[5]/menu[2]/menu[2]").Select()
+        session.findById("wnd[1]/usr/ctxtDY_PATH").Text = pasta_tabelas
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").Text = "ZFIT009.csv"
+        session.findById("wnd[1]/tbar[0]/btn[11]").Press()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Falha na importação SAP da ZFIT009: %s", exc)
+        return None
+
+    registros, cabecalho_encontrado = parse_tabela_pipe(caminho, "zfit009", logger)
+    if not _validar_importacao_tabela(caminho, "zfit009", registros, cabecalho_encontrado, logger):
+        return None
+    return _salvar_tabela_normalizada("zfit009", registros, pasta_tabelas, logger)
+
+
+def importar_zco059_sap(session, pasta_tabelas: str, logger: logging.Logger):
+    """
+    Importa ZCO059 via SAP GUI Scripting e salva em saidas/tabelas/ZCO059.csv.
+    """
+    os.makedirs(pasta_tabelas, exist_ok=True)
+    caminho = os.path.join(pasta_tabelas, "ZCO059.csv")
+    try:
+        session.findById("wnd[0]/tbar[0]/okcd").Text = "zco059"
+        session.findById("wnd[0]").sendVKey(0)
+        session.findById("wnd[0]/usr/cntlGRID1/shellcont/shell").pressToolbarButton("&COL0")
+        session.findById("wnd[0]/usr/cntlGRID1/shellcont/shell").selectColumn("CONSOLIDA")
+        session.findById("wnd[0]/usr/cntlGRID1/shellcont/shell").pressToolbarButton("&MB_FILTER")
+        session.findById("wnd[1]/usr/txtDYN001-LOW").Text = "S"
+        session.findById("wnd[1]/tbar[0]/btn[0]").Press()
+        session.findById("wnd[0]/usr/cntlGRID1/shellcont/shell").pressToolbarButton("&MB_EXPORT")
+        session.findById("wnd[1]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/radSPOPLI-SELFLAG[1,0]").Select()
+        session.findById("wnd[1]/tbar[0]/btn[0]").Press()
+        session.findById("wnd[1]/usr/ctxtDY_PATH").Text = pasta_tabelas
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").Text = "ZCO059.csv"
+        session.findById("wnd[1]/tbar[0]/btn[11]").Press()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Falha na importação SAP da ZCO059: %s", exc)
+        return None
+
+    registros, cabecalho_encontrado = parse_tabela_pipe(caminho, "zco059", logger)
+    if not _validar_importacao_tabela(caminho, "zco059", registros, cabecalho_encontrado, logger):
+        return None
+    return _salvar_tabela_normalizada("zco059", registros, pasta_tabelas, logger)
+
+
+def carregar_tabela_normalizada(tipo: str, pasta_tabelas: str, logger: logging.Logger):
+    """Carrega tabela previamente normalizada da pasta de tabelas."""
+    caminho = os.path.join(pasta_tabelas, "ZFIT009.csv" if tipo == "zfit009" else "ZCO059.csv")
+    if not os.path.isfile(caminho):
+        logger.error("Tabela %s não encontrada em '%s'.", tipo.upper(), caminho)
+        return None
+    registros, cabecalho_encontrado = parse_tabela_pipe(caminho, tipo, logger)
+    if not _validar_importacao_tabela(caminho, tipo, registros, cabecalho_encontrado, logger):
+        return None
+    return registros
+
+
+def gerar_consolidacao(pasta_tabelas: str, pasta_consolidado: str, logger: logging.Logger):
+    """
+    Gera Consolidacao_Cliente_Divisao_Consolida.csv a partir de ZFIT009 e ZCO059.
+    """
+    zfit = carregar_tabela_normalizada("zfit009", pasta_tabelas, logger)
+    zco = carregar_tabela_normalizada("zco059", pasta_tabelas, logger)
+    if zfit is None or zco is None:
+        return None
+
+    divisao_consolida = {}
+    for item in zco:
+        divisao = item["Divisão"].strip()
+        if not divisao:
+            continue
+        valor = item["Consolida"].strip().upper()
+        if valor == "S":
+            divisao_consolida[divisao] = "S"
+        elif divisao not in divisao_consolida:
+            divisao_consolida[divisao] = valor
+
+    por_cliente = defaultdict(set)
+    divisao_vazia = 0
+    linhas_saida = []
+    for item in zfit:
+        cliente = item["Cliente"].strip()
+        divisao = item["Divisão"].strip()
+        por_cliente[cliente].add(divisao)
+        if not divisao:
+            divisao_vazia += 1
+        consolida = "S" if divisao and divisao_consolida.get(divisao, "") == "S" else ""
+        linhas_saida.append((cliente, divisao, consolida))
+
+    clientes_ambiguos = {c: sorted(v) for c, v in por_cliente.items() if len(v) > 1}
+    if clientes_ambiguos:
+        logger.warning("Clientes com múltiplas divisões na ZFIT009: %d", len(clientes_ambiguos))
+        for cliente, divs in list(clientes_ambiguos.items())[:30]:
+            logger.warning("  Cliente %s → divisões %s", cliente, ", ".join(d or "(vazia)" for d in divs))
+    if divisao_vazia:
+        logger.warning("Registros com divisão vazia na ZFIT009: %d", divisao_vazia)
+
+    os.makedirs(pasta_consolidado, exist_ok=True)
+    caminho_saida = os.path.join(
+        pasta_consolidado,
+        "Consolidacao_Cliente_Divisao_Consolida.csv",
+    )
+    with open(caminho_saida, "w", encoding="utf-8-sig", newline="") as f:
+        f.write("Cliente|Divisão|Consolida\n")
+        for cliente, divisao, consolida in linhas_saida:
+            f.write(f"{cliente}|{divisao}|{consolida}\n")
+
+    logger.info(
+        "Consolidação Cliente→Divisão→Consolida gerada: '%s' (%d linhas).",
+        caminho_saida,
+        len(linhas_saida),
+    )
+    return caminho_saida
+
+
+def aplicar_status_consolidacao(
+    arquivo_classificado: str,
+    arquivo_consolidacao: str,
+    pasta_saida: str,
+    logger: logging.Logger,
+):
+    """
+    Adiciona colunas Divisão, Consolida e Status Consolidação ao classificado.
+    """
+    if not os.path.isfile(arquivo_classificado):
+        logger.error("Arquivo classificado não encontrado: '%s'", arquivo_classificado)
+        return None
+    if not os.path.isfile(arquivo_consolidacao):
+        logger.error("Arquivo de consolidação não encontrado: '%s'", arquivo_consolidacao)
+        return None
+
+    idx_consolida = {}
+    for linha in ler_csv_corrigindo_encoding(arquivo_consolidacao, logger):
+        texto = linha.strip()
+        if not texto:
+            continue
+        if texto.lower().startswith("cliente|"):
+            continue
+        if texto.startswith("|"):
+            partes = [p.strip() for p in linha.split("|")[1:-1]]
+        else:
+            partes = [p.strip() for p in linha.split("|")]
+        if len(partes) < 3:
+            continue
+        cliente, divisao, consolida = partes[0], partes[1], partes[2].upper()
+        idx_consolida.setdefault(cliente, []).append((divisao, consolida))
+
+    linhas_saida = []
+    clientes_sem_match = set()
+    elimina = 0
+    nao_consolida = 0
+
+    cabecalho_saida = None
+    for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
+        tp = tipo_de_linha(linha)
+        if tp == "cabecalho":
+            cabecalho_saida = linha.rstrip("|") + "|Divisão|Consolida|Status Consolidação|"
+            continue
+        if tp != "dado":
+            continue
+
+        campos = parse_linha(linha)
+        cliente = campos[IDX_CLIENTE].strip() if len(campos) > IDX_CLIENTE else ""
+        correspondencias = idx_consolida.get(cliente, [])
+
+        if not correspondencias:
+            divisao = ""
+            consolida = ""
+            status = "Não Consolida"
+            if cliente:
+                clientes_sem_match.add(cliente)
+            nao_consolida += 1
+        else:
+            divs = sorted({d for d, _ in correspondencias if d})
+            divisao = ";".join(divs)
+            consolida = "S" if any(c == "S" for _, c in correspondencias) else ""
+            if consolida == "S":
+                status = "Elimina"
+                elimina += 1
+            else:
+                status = "Não Consolida"
+                nao_consolida += 1
+
+        linhas_saida.append(linha.rstrip("|") + f"|{divisao}|{consolida}|{status}|")
+
+    os.makedirs(pasta_saida, exist_ok=True)
+    caminho_saida = os.path.join(pasta_saida, os.path.basename(arquivo_classificado))
+    with open(caminho_saida, "w", encoding="utf-8-sig", newline="") as f:
+        f.write((cabecalho_saida or (CABECALHO_CONSOLIDADO.rstrip("|") + "|Classificação|Divisão|Consolida|Status Consolidação|")) + "\n")
+        for linha in linhas_saida:
+            f.write(linha + "\n")
+
+    logger.info("Status consolidação aplicado em '%s'.", caminho_saida)
+    logger.info("Status Consolidação: Elimina=%d | Não Consolida=%d", elimina, nao_consolida)
+    logger.info("Clientes sem correspondência na consolidação: %d", len(clientes_sem_match))
+    for cliente in sorted(list(clientes_sem_match))[:30]:
+        logger.warning("  Cliente sem match: %s", cliente)
+
+    return caminho_saida
+
+
+def separar_contrapartidas(
+    arquivo_classificado: str,
+    pasta_saida: str,
+    logger: logging.Logger,
+):
+    """
+    Move linhas de contas de contrapartida para auditoria e remove do principal.
+    """
+    if not os.path.isfile(arquivo_classificado):
+        logger.error("Arquivo classificado não encontrado: '%s'", arquivo_classificado)
+        return None, None
+
+    cabecalho = None
+    linhas_principais = []
+    linhas_auditoria = []
+    for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
+        tp = tipo_de_linha(linha)
+        if tp == "cabecalho":
+            cabecalho = linha
+            continue
+        if tp != "dado":
+            continue
+        campos = parse_linha(linha)
+        conta = campos[IDX_CONTA].strip() if len(campos) > IDX_CONTA else ""
+        if conta in CONTAS_CONTRAPARTIDA_AUDITORIA:
+            linhas_auditoria.append(linha)
+        else:
+            linhas_principais.append(linha)
+
+    base = os.path.basename(arquivo_classificado)
+    data_ini_str, data_fim_str = _extrair_datas_do_nome(base)
+    periodo = f"{data_ini_str}_a_{data_fim_str}"
+
+    os.makedirs(pasta_saida, exist_ok=True)
+    caminho_principal = os.path.join(pasta_saida, base)
+    caminho_auditoria = os.path.join(pasta_saida, f"Auditoria_Contrapartidas_{periodo}.csv")
+
+    with open(caminho_principal, "w", encoding="utf-8-sig", newline="") as f:
+        f.write((cabecalho or (CABECALHO_CONSOLIDADO.rstrip("|") + "|Classificação|")) + "\n")
+        for linha in linhas_principais:
+            f.write(linha + "\n")
+
+    with open(caminho_auditoria, "w", encoding="utf-8-sig", newline="") as f:
+        f.write((cabecalho or (CABECALHO_CONSOLIDADO.rstrip("|") + "|Classificação|")) + "\n")
+        for linha in linhas_auditoria:
+            f.write(linha + "\n")
+
+    logger.info(
+        "Contrapartidas separadas: %d linha(s) para auditoria em '%s'.",
+        len(linhas_auditoria),
+        caminho_auditoria,
+    )
+    logger.info(
+        "Arquivo principal atualizado sem contrapartidas: %d linha(s) em '%s'.",
+        len(linhas_principais),
+        caminho_principal,
+    )
+    return caminho_principal, caminho_auditoria
+
+
+def exportar_excel_corporativo(caminho_csv: str, logger: logging.Logger):
+    """Gera versão Excel do classificado com formatação corporativa."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError:
+        logger.error("openpyxl não instalado. Execute: pip install openpyxl")
+        return None
+
+    if not os.path.isfile(caminho_csv):
+        logger.error("Arquivo CSV não encontrado para exportação Excel: '%s'", caminho_csv)
+        return None
+
+    linhas = []
+    for linha in ler_csv_corrigindo_encoding(caminho_csv, logger):
+        if not linha.strip():
+            continue
+        texto = linha.strip()
+        if texto.startswith("|") and texto.endswith("|"):
+            linhas.append([c.strip() for c in linha.split("|")[1:-1]])
+        else:
+            linhas.append([c.strip() for c in linha.split("|")])
+
+    if not linhas:
+        logger.error("Arquivo CSV vazio para exportação Excel: '%s'", caminho_csv)
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Classificado"
+
+    for row in linhas:
+        ws.append(row)
+
+    cabecalho_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = cabecalho_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    idx_montante = None
+    idx_st = None
+    for i, valor in enumerate(linhas[0], start=1):
+        if "Montante" in valor:
+            idx_montante = i
+        if valor.strip() == "St":
+            idx_st = i
+
+    for col in ws.columns:
+        comprimento = max(len(str(c.value or "")) for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(comprimento + 2, 80)
+
+    if idx_montante:
+        for r in range(2, ws.max_row + 1):
+            cell = ws.cell(row=r, column=idx_montante)
+            valor = _parse_montante(str(cell.value))
+            if valor is not None:
+                cell.value = valor
+                cell.number_format = '#,##0.00_);[Red](#,##0.00)'
+                cell.alignment = Alignment(horizontal="right")
+
+    if idx_st:
+        for r in range(2, ws.max_row + 1):
+            st = str(ws.cell(row=r, column=idx_st).value or "").strip()
+            if "*" in st or "TOTAL" in st.upper():
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(row=r, column=c).fill = total_fill
+                    ws.cell(row=r, column=c).font = Font(bold=True)
+
+    caminho_xlsx = os.path.splitext(caminho_csv)[0] + ".xlsx"
+    wb.save(caminho_xlsx)
+    logger.info("Excel corporativo gerado: '%s'", caminho_xlsx)
+    return caminho_xlsx
+
+
+def carregar_saldo_inicial(logger: logging.Logger):
+    """Carrega saldo inicial persistido (se existir)."""
+    if not os.path.isfile(ARQUIVO_SALDO_INICIAL):
+        return None
+    try:
+        with open(ARQUIVO_SALDO_INICIAL, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+        ultimo = dados.get("ultimo")
+        if ultimo and isinstance(ultimo.get("valor"), (int, float)):
+            return ultimo
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Falha ao ler saldo inicial persistido: %s", exc)
+    return None
+
+
+def salvar_saldo_inicial(valor: float, periodo: str, logger: logging.Logger):
+    """Persiste saldo inicial e mantém histórico simples de alterações."""
+    os.makedirs(PASTA_BASE, exist_ok=True)
+    dados = {"historico": []}
+    if os.path.isfile(ARQUIVO_SALDO_INICIAL):
+        try:
+            with open(ARQUIVO_SALDO_INICIAL, "r", encoding="utf-8") as f:
+                dados = json.load(f)
+            if "historico" not in dados or not isinstance(dados["historico"], list):
+                dados["historico"] = []
+        except Exception:  # noqa: BLE001
+            dados = {"historico": []}
+
+    registro = {
+        "valor": valor,
+        "periodo": periodo,
+        "data_alteracao": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "usuario": getuser(),
+    }
+    dados["ultimo"] = registro
+    dados["historico"].append(registro)
+
+    with open(ARQUIVO_SALDO_INICIAL, "w", encoding="utf-8") as f:
+        json.dump(dados, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        "Saldo inicial atualizado: %s (período=%s, usuário=%s).",
+        _formatar_valor_br(valor),
+        periodo,
+        registro["usuario"],
+    )
+    return registro
+
+
+def calcular_saldo_final_fluxo(
+    saldo_inicial: float,
+    adicoes: float,
+    eliminacoes: float,
+    juros: float,
+    iof: float,
+    irrf: float,
+    baixas: float,
+) -> float:
+    """
+    Fórmula de fluxo calibrável:
+    Saldo Final = Saldo Inicial + Adições − Eliminações + Juros + IOF − IRRF − Baixas
+    """
+    return saldo_inicial + adicoes - eliminacoes + juros + iof - irrf - baixas
+
+
+def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logging.Logger):
+    """Gera resumo de fluxo (CSV + Excel) com Saldo Inicial e Saldo Final."""
+    if not os.path.isfile(arquivo_classificado):
+        logger.error("Arquivo classificado não encontrado: '%s'", arquivo_classificado)
+        return None
+
+    dados_saldo = carregar_saldo_inicial(logger)
+    saldo_default = dados_saldo["valor"] if dados_saldo else 0.0
+    periodo_default = dados_saldo["periodo"] if dados_saldo else ""
+    prompt = f"Saldo Inicial (BR) [padrão: {_formatar_valor_br(saldo_default)}]: "
+    entrada = input(prompt).strip()
+    saldo_inicial = _parse_numero_br(entrada) if entrada else saldo_default
+    if saldo_inicial is None:
+        logger.warning("Saldo Inicial inválido informado; usando 0,00.")
+        saldo_inicial = 0.0
+
+    periodo = input(
+        f"Período/Trimestre de referência [padrão: {periodo_default or 'não informado'}]: "
+    ).strip() or periodo_default or "não informado"
+    salvar_saldo_inicial(saldo_inicial, periodo, logger)
+
+    totais = {"Adições": 0.0, "Juros": 0.0, "IOF": 0.0, "IRRF": 0.0, "Baixa": 0.0}
+    eliminacoes = 0.0
+    elimina_linhas = 0
+
+    idx_classif = None
+    idx_status = None
+    idx_montante = IDX_MONTANTE
+
+    for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
+        tp = tipo_de_linha(linha)
+        if tp == "cabecalho":
+            campos = parse_linha(linha)
+            for i, c in enumerate(campos):
+                c_norm = c.strip().lower()
+                if "classificação" in c_norm or "classificacao" in c_norm:
+                    idx_classif = i
+                if "status consolidação" in c_norm or "status consolidacao" in c_norm:
+                    idx_status = i
+                if "montante" in c_norm:
+                    idx_montante = i
+            continue
+        if tp != "dado":
+            continue
+
+        campos = parse_linha(linha)
+        conta = campos[IDX_CONTA].strip() if len(campos) > IDX_CONTA else ""
+        if not conta.startswith(PREFIXO_MUTUO):
+            continue
+
+        classif = campos[idx_classif].strip() if idx_classif is not None and len(campos) > idx_classif else ""
+        montante = _parse_montante(campos[idx_montante]) if len(campos) > idx_montante else 0.0
+        montante = montante or 0.0
+        if classif in totais:
+            totais[classif] += montante
+
+        status = campos[idx_status].strip() if idx_status is not None and len(campos) > idx_status else ""
+        if status == "Elimina":
+            eliminacoes += montante
+            elimina_linhas += 1
+
+    adicoes = totais.get("Adições", 0.0)
+    juros = totais.get("Juros", 0.0)
+    iof = totais.get("IOF", 0.0)
+    irrf = totais.get("IRRF", 0.0)
+    baixas = totais.get("Baixa", 0.0)
+    saldo_final = calcular_saldo_final_fluxo(
+        saldo_inicial, adicoes, eliminacoes, juros, iof, irrf, baixas
+    )
+
+    linhas_fluxo = [
+        ("Saldo Inicial", saldo_inicial),
+        ("Adições", adicoes),
+        ("(-) Eliminações", eliminacoes),
+        ("Juros", juros),
+        ("IOF", iof),
+        ("IRRF", irrf),
+        ("Baixas", baixas),
+        ("Saldo Final", saldo_final),
+    ]
+
+    data_ini_str, data_fim_str = _extrair_datas_do_nome(os.path.basename(arquivo_classificado))
+    nome_csv = f"Resumo_{data_ini_str}_a_{data_fim_str}.csv"
+    caminho_csv = os.path.join(pasta_saida, nome_csv)
+    os.makedirs(pasta_saida, exist_ok=True)
+
+    with open(caminho_csv, "w", encoding="utf-8-sig", newline="") as f:
+        f.write("Etapa|Valor\n")
+        for etapa, valor in linhas_fluxo:
+            f.write(f"{etapa}|{_formatar_valor_br(valor)}\n")
+
+    caminho_xlsx = os.path.join(pasta_saida, f"Resumo_{data_ini_str}_a_{data_fim_str}.xlsx")
+    exportar_resumo_fluxo_xlsx(caminho_xlsx, linhas_fluxo, logger)
+
+    separador = "-" * 62
+    print(separador)
+    print(f"  RESUMO FLUXO — {os.path.basename(arquivo_classificado)}")
+    print(separador)
+    for etapa, valor in linhas_fluxo:
+        print(f"  {etapa:<20} {_formatar_valor_br(valor):>20}")
+    print(separador)
+
+    logger.info("Resumo fluxo gerado em '%s' e '%s'.", caminho_csv, caminho_xlsx)
+    logger.info("Linhas marcadas como Elimina: %d", elimina_linhas)
+    return caminho_csv
+
+
+def exportar_resumo_fluxo_xlsx(caminho_xlsx: str, linhas_fluxo: list, logger: logging.Logger):
+    """Exporta resumo de fluxo para Excel com destaque de saldos."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError:
+        logger.error("openpyxl não instalado. Execute: pip install openpyxl")
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Resumo Fluxo"
+    ws.append(["Etapa", "Valor"])
+
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    destaque_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for etapa, valor in linhas_fluxo:
+        ws.append([etapa, valor])
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 20
+
+    for r in range(2, ws.max_row + 1):
+        ws.cell(row=r, column=2).number_format = '#,##0.00_);[Red](#,##0.00)'
+        ws.cell(row=r, column=2).alignment = Alignment(horizontal="right")
+        etapa = str(ws.cell(row=r, column=1).value)
+        if etapa in {"Saldo Inicial", "Saldo Final"}:
+            for c in (1, 2):
+                ws.cell(row=r, column=c).font = Font(bold=True)
+                ws.cell(row=r, column=c).fill = destaque_fill
+
+    wb.save(caminho_xlsx)
+    logger.info("Resumo Excel gerado: '%s'", caminho_xlsx)
+    return caminho_xlsx
+
+
+# ---------------------------------------------------------------------------
 # RESUMO
 # ---------------------------------------------------------------------------
 
@@ -1348,20 +2087,169 @@ def _executar_classificar(logger: logging.Logger, caminho_log: str) -> None:
     print("=" * 60)
 
 
-def _executar_resumo(logger: logging.Logger, caminho_log: str) -> None:
-    """Opção 3: Gera resumo de um arquivo classificado existente."""
+def _executar_importar_tabelas(logger: logging.Logger, caminho_log: str) -> None:
+    """Opção: importa/atualiza ZFIT009 e ZCO059 via SAP ou arquivo manual."""
     print("=" * 60)
-    print("  Resumo do Classificado")
+    print("  Importar ZFIT009 / ZCO059")
     print("=" * 60)
 
-    arq = selecionar_arquivo_entrada(
-        "Arquivo classificado para gerar o resumo",
+    print("Fonte de importação:")
+    print("  1 - SAP GUI Scripting")
+    print("  2 - Arquivo já exportado manualmente")
+    origem = input("Opção [2]: ").strip() or "2"
+
+    if origem == "1":
+        sistema = _ler_sistema(logger)
+        session = conectar_sap(sistema, logger)
+        if session is None:
+            print("  Falha ao conectar no SAP (ver LOG).")
+            return
+        zfit = importar_zfit009_sap(session, PASTA_TABELAS, logger)
+        zco = importar_zco059_sap(session, PASTA_TABELAS, logger)
+    else:
+        arq_zfit = selecionar_arquivo_entrada(
+            "Arquivo ZFIT009 (manual)",
+            "ZFIT009*.csv",
+            PASTA_TABELAS,
+            logger,
+        )
+        arq_zco = selecionar_arquivo_entrada(
+            "Arquivo ZCO059 (manual)",
+            "ZCO059*.csv",
+            PASTA_TABELAS,
+            logger,
+        )
+        zfit = importar_tabela_de_arquivo(arq_zfit, "zfit009", PASTA_TABELAS, logger)
+        zco = importar_tabela_de_arquivo(arq_zco, "zco059", PASTA_TABELAS, logger)
+
+    print("\n" + "=" * 60)
+    if zfit and zco:
+        print(f"  ZFIT009: {zfit}")
+        print(f"  ZCO059 : {zco}")
+    else:
+        print("  Falha na importação de tabelas (verifique o LOG).")
+    print(f"  LOG: {caminho_log}")
+    print("=" * 60)
+
+
+def _executar_gerar_consolidacao(logger: logging.Logger, caminho_log: str) -> None:
+    """Opção: gera Consolidação Cliente|Divisão|Consolida."""
+    print("=" * 60)
+    print("  Gerar Tabela de Consolidação")
+    print("=" * 60)
+
+    caminho = gerar_consolidacao(PASTA_TABELAS, PASTA_CONSOLIDADO, logger)
+
+    print("\n" + "=" * 60)
+    if caminho:
+        print(f"  Consolidação gerada: {caminho}")
+    else:
+        print("  Falha ao gerar consolidação (verifique o LOG).")
+    print(f"  LOG: {caminho_log}")
+    print("=" * 60)
+
+
+def _executar_aplicar_status_consolidacao(logger: logging.Logger, caminho_log: str) -> None:
+    """Opção: aplica status de consolidação no classificado."""
+    print("=" * 60)
+    print("  Aplicar Status Consolidação")
+    print("=" * 60)
+
+    arq_classificado = selecionar_arquivo_entrada(
+        "Arquivo classificado para complementar",
         "Classificado_*.csv",
         PASTA_CONSOLIDADO,
         logger,
     )
+    arq_consolidacao = selecionar_arquivo_entrada(
+        "Arquivo de consolidação cliente/divisão/consolida",
+        "Consolidacao_Cliente_Divisao_Consolida.csv",
+        PASTA_CONSOLIDADO,
+        logger,
+    )
+    saida = aplicar_status_consolidacao(
+        arq_classificado, arq_consolidacao, PASTA_CONSOLIDADO, logger
+    )
 
-    resumo = gerar_resumo(arq, PASTA_CONSOLIDADO, logger)
+    print("\n" + "=" * 60)
+    if saida:
+        print(f"  Classificado com status: {saida}")
+    else:
+        print("  Falha ao aplicar status (verifique o LOG).")
+    print(f"  LOG: {caminho_log}")
+    print("=" * 60)
+
+
+def _executar_tratar_contrapartidas(logger: logging.Logger, caminho_log: str) -> None:
+    """Opção: separa contrapartidas para auditoria."""
+    print("=" * 60)
+    print("  Tratar Contrapartidas (Auditoria)")
+    print("=" * 60)
+
+    arq_classificado = selecionar_arquivo_entrada(
+        "Arquivo classificado para separar contrapartidas",
+        "Classificado_*.csv",
+        PASTA_CONSOLIDADO,
+        logger,
+    )
+    principal, auditoria = separar_contrapartidas(arq_classificado, PASTA_CONSOLIDADO, logger)
+    xlsx = exportar_excel_corporativo(principal, logger) if principal else None
+
+    print("\n" + "=" * 60)
+    if principal and auditoria:
+        print(f"  Principal : {principal}")
+        print(f"  Auditoria : {auditoria}")
+        if xlsx:
+            print(f"  Excel     : {xlsx}")
+    else:
+        print("  Falha ao tratar contrapartidas (verifique o LOG).")
+    print(f"  LOG: {caminho_log}")
+    print("=" * 60)
+
+
+def _executar_saldo_inicial(logger: logging.Logger, caminho_log: str) -> None:
+    """Opção: informa/atualiza saldo inicial persistido."""
+    print("=" * 60)
+    print("  Informar / Atualizar Saldo Inicial")
+    print("=" * 60)
+
+    atual = carregar_saldo_inicial(logger)
+    if atual:
+        print(
+            f"Saldo atual: {_formatar_valor_br(atual['valor'])} | "
+            f"Período: {atual.get('periodo', '')} | "
+            f"Atualizado em: {atual.get('data_alteracao', '')} | "
+            f"Usuário: {atual.get('usuario', '')}"
+        )
+    valor_txt = input("Novo Saldo Inicial (BR): ").strip()
+    valor = _parse_numero_br(valor_txt)
+    if valor is None:
+        print("  ✗ Valor inválido.")
+        logger.warning("Saldo inicial inválido informado: '%s'", valor_txt)
+        return
+    periodo = input("Período/Trimestre de referência: ").strip() or "não informado"
+    salvar_saldo_inicial(valor, periodo, logger)
+
+    print("\n" + "=" * 60)
+    print("  Saldo inicial atualizado com sucesso.")
+    print(f"  Arquivo: {ARQUIVO_SALDO_INICIAL}")
+    print(f"  LOG: {caminho_log}")
+    print("=" * 60)
+
+
+def _executar_resumo_fluxo(logger: logging.Logger, caminho_log: str) -> None:
+    """Opção: gera resumo de fluxo do classificado."""
+    print("=" * 60)
+    print("  Resumo de Fluxo (Saldo Inicial → Saldo Final)")
+    print("=" * 60)
+
+    arq = selecionar_arquivo_entrada(
+        "Arquivo classificado para gerar resumo",
+        "Classificado_*.csv",
+        PASTA_CONSOLIDADO,
+        logger,
+    )
+    resumo = gerar_resumo_fluxo(arq, PASTA_CONSOLIDADO, logger)
 
     print("\n" + "=" * 60)
     if resumo:
@@ -1373,9 +2261,9 @@ def _executar_resumo(logger: logging.Logger, caminho_log: str) -> None:
 
 
 def _executar_tudo(logger: logging.Logger, caminho_log: str) -> None:
-    """Opção 4: Extrai, consolida, classifica e resume em sequência."""
+    """Opção: executa pipeline completo com consolidação intercompany."""
     print("=" * 60)
-    print("  Executar Tudo: Extrair → Classificar → Resumir")
+    print("  Executar Tudo: Extrair → Classificar → Consolidar → Status → Auditoria → Resumo")
     print("=" * 60)
 
     data_inicial = _ler_data("Data inicial (dd.mm.aaaa): ", logger)
@@ -1421,11 +2309,35 @@ def _executar_tudo(logger: logging.Logger, caminho_log: str) -> None:
         print("  Falha na classificação. Resumo não gerado.")
         return
 
-    resumo = gerar_resumo(classificado, PASTA_CONSOLIDADO, logger)
+    consolidacao = gerar_consolidacao(PASTA_TABELAS, PASTA_CONSOLIDADO, logger)
+    if not consolidacao:
+        print("  Falha ao gerar consolidação (importe ZFIT009/ZCO059 e tente novamente).")
+        return
+
+    classificado_status = aplicar_status_consolidacao(
+        classificado, consolidacao, PASTA_CONSOLIDADO, logger
+    )
+    if not classificado_status:
+        print("  Falha ao aplicar status de consolidação.")
+        return
+
+    classificado_final, auditoria = separar_contrapartidas(
+        classificado_status, PASTA_CONSOLIDADO, logger
+    )
+    if not classificado_final:
+        print("  Falha no tratamento de contrapartidas.")
+        return
+
+    xlsx_classificado = exportar_excel_corporativo(classificado_final, logger)
+    resumo = gerar_resumo_fluxo(classificado_final, PASTA_CONSOLIDADO, logger)
 
     print("\n" + "=" * 60)
     print(f"  Consolidado  : {consolidado}")
-    print(f"  Classificado : {classificado}")
+    print(f"  Classificado : {classificado_final}")
+    print(f"  Consolidação : {consolidacao}")
+    print(f"  Auditoria    : {auditoria}")
+    if xlsx_classificado:
+        print(f"  Excel Class. : {xlsx_classificado}")
     if resumo:
         print(f"  Resumo       : {resumo}")
     print(f"  LOG          : {caminho_log}")
@@ -1445,8 +2357,13 @@ def mostrar_menu_principal() -> str:
     print("=" * 60)
     print("  1 - Extrair razão (FBL3N) + Consolidar")
     print("  2 - Classificar consolidado")
-    print("  3 - Resumo do classificado")
-    print("  4 - Executar tudo (Extrair → Classificar → Resumir)")
+    print("  3 - Importar ZFIT009 / ZCO059")
+    print("  4 - Gerar tabela de consolidação")
+    print("  5 - Aplicar Status Consolidação na movimentação")
+    print("  6 - Tratar contrapartidas (auditoria) + Excel classificado")
+    print("  7 - Informar/atualizar Saldo Inicial")
+    print("  8 - Resumo (Saldo Inicial → Saldo Final)")
+    print("  9 - Executar tudo em sequência")
     print("  0 - Sair")
     print("-" * 60)
     return input("Opção: ").strip()
@@ -1458,7 +2375,7 @@ def mostrar_menu_principal() -> str:
 
 def main() -> None:
     # Garantir que as pastas de saída existam
-    for pasta in (PASTA_DIARIOS, PASTA_CONSOLIDADO, PASTA_LOGS):
+    for pasta in (PASTA_DIARIOS, PASTA_CONSOLIDADO, PASTA_TABELAS, PASTA_LOGS):
         os.makedirs(pasta, exist_ok=True)
 
     logger, caminho_log = configurar_log(PASTA_LOGS)
@@ -1466,8 +2383,13 @@ def main() -> None:
     acoes = {
         "1": _executar_extracao,
         "2": _executar_classificar,
-        "3": _executar_resumo,
-        "4": _executar_tudo,
+        "3": _executar_importar_tabelas,
+        "4": _executar_gerar_consolidacao,
+        "5": _executar_aplicar_status_consolidacao,
+        "6": _executar_tratar_contrapartidas,
+        "7": _executar_saldo_inicial,
+        "8": _executar_resumo_fluxo,
+        "9": _executar_tudo,
     }
 
     while True:
@@ -1486,7 +2408,7 @@ def main() -> None:
             except KeyboardInterrupt:
                 print("\nOperação interrompida. Voltando ao menu.")
         else:
-            print(f"  ✗ Opção inválida: '{opcao}'. Digite 0, 1, 2, 3 ou 4.")
+            print(f"  ✗ Opção inválida: '{opcao}'. Digite 0 a 9.")
 
 
 if __name__ == "__main__":
