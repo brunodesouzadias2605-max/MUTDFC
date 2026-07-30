@@ -52,8 +52,10 @@ Tratamentos:
 
 Opção 3 permite:
 
-- **Via SAP GUI Scripting** (SE16/ZCO059 portados do VBS para `win32com`).
-- **Via arquivo manual** já exportado.
+- **Via SAP GUI Scripting** — fluxo portado diretamente dos VBS gravados na
+  sessão atual (IDs de controle alinhados aos gravados; não usar com VBS antigos).
+- **Via arquivo manual** já exportado (padrão sugerido quando a automação SAP
+  não estiver disponível ou o usuário preferir exportar manualmente).
 
 As tabelas são validadas por:
 
@@ -61,10 +63,55 @@ As tabelas são validadas por:
 - cabeçalho esperado;
 - quantidade de linhas de dados > 0.
 
-Destino padronizado:
+Destino padronizado (derivado automaticamente de `os.path.abspath(__file__)`):
 
 - `saidas/tabelas/ZFIT009.csv`
 - `saidas/tabelas/ZCO059.csv`
+
+### Fluxo SAP — ZFIT009 (alinhado ao VBS gravado)
+
+1. Maximizar janela (`wnd[0].maximize`).
+2. Navegar para SE16 via campo de comando (`okcd` + `sendVKey 0`).
+3. Inserir nome da tabela `ZFIT009` e confirmar.
+4. Abrir configuração de campos via **`menu[3]/menu[0]/menu[1]`** (não por sendVKey direto).
+5. `sendVKey 14` para acessar seleção de campos.
+6. Marcar `chk[1,5]` e `chk[1,11]`; usar **`sendVKey 6`** para aplicar (não `sendVKey 8`).
+7. **`sendVKey 8`** (F8) para executar a lista; aguardar 2 s.
+8. **`sendVKey 20`** para abrir menu de download/exportação.
+9. `sendVKey 0` para confirmar o tipo de arquivo.
+10. Preencher `DY_PATH` (pasta `saidas/tabelas` do projeto) e `DY_FILENAME = ZFIT009.csv`.
+11. `btn[11]` (Salvar/Substituir).
+12. 3× `sendVKey 3` para fechar telas e retornar ao menu.
+
+### Fluxo SAP — ZCO059 (alinhado ao VBS gravado)
+
+1. Navegar para `zco059` via campo de comando.
+2. Aguardar ALV grid em `subSUB_DRE:ZCOR043:0100/cntlCCONTAINER_1/shellcont/shell`.
+3. `pressToolbarButton "&COL0"` para abrir seleção de colunas.
+4. Sequência de `btnAPP_FL_SING.press` com `currentCellRow` conforme VBS (11 pressionamentos).
+5. `btn[0]` para confirmar seleção de colunas.
+6. `setCurrentCell(-1, "CONSOLIDA")` + `selectColumn("CONSOLIDA")`.
+7. `pressToolbarContextButton "&MB_FILTER"` + `selectContextMenuItem "&FILTER"`.
+8. Preencher `%%DYN001-LOW = "S"` e confirmar com `btn[0]`.
+9. `pressToolbarContextButton "&MB_EXPORT"` + `selectContextMenuItem "&PC"`.
+10. `btn[0]` para confirmar tipo de exportação.
+11. Preencher `DY_PATH` e `DY_FILENAME = ZCO059.csv`; salvar com `btn[11]`.
+
+### Robustez contra o erro 619
+
+O helper `esperar_controle(session, control_id, timeout, intervalo, logger)` chama
+`session.findById(control_id, False)` em loop com pausas até o controle aparecer,
+evitando o erro 619 *"The control could not be found by id"*. É chamado antes de
+cada interação com controles que dependem de carregamento assíncrono da tela SAP.
+
+### Importar de arquivo já exportado
+
+Ao escolher a opção **2 - Arquivo já exportado manualmente** no submenu de importação,
+o sistema lê o CSV com o parser de largura fixa (`|`) incluindo:
+
+- correção de mojibake (`Divis\xef\xbf\xbd\xef\xbf\xbdo` → `Divisão`);
+- ignora linhas de título, separadores e rodapé SAP;
+- valida cabeçalho e volume mínimo de dados antes de aceitar o arquivo.
 
 ---
 
