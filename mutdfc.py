@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from getpass import getuser
@@ -132,6 +133,31 @@ _ORDEM_FLUXO = [
 # Sentinel retornado por extrair_razao() quando o dia não tem partidas.
 # Distingue "sem dados" (fluxo normal) de None (falha/erro).
 _SEM_DADOS = ""
+
+# ---------------------------------------------------------------------------
+# IDs SAP GUI dos controles usados na importação ZFIT009 / ZCO059
+# (alinhados com os VBS gravados na sessão atual — não alterar sem novo VBS)
+# ---------------------------------------------------------------------------
+
+# ZFIT009 — SE16: menu de configuração de campos
+_ZFIT009_MENU_CAMPOS = "wnd[0]/mbar/menu[3]/menu[0]/menu[1]"
+
+# ZCO059 — caminho do ALV Grid principal e controles de seleção/exportação
+_ZCO059_SHELL = (
+    "wnd[0]/usr/subSUB_DRE:ZCOR043:0100/cntlCCONTAINER_1/shellcont/shell"
+)
+_ZCO059_COL_BTN = (
+    "wnd[1]/usr/tabsG_TS_ALV/tabpALV_M_R1"
+    "/ssubSUB_CONFIGURATION:SAPLSALV_CUL_COLUMN_SELECTION:0620/btnAPP_FL_SING"
+)
+_ZCO059_COL_TBL = (
+    "wnd[1]/usr/tabsG_TS_ALV/tabpALV_M_R1"
+    "/ssubSUB_CONFIGURATION:SAPLSALV_CUL_COLUMN_SELECTION:0620"
+    "/tblSAPLSALV_CUL_COLUMN_SELECTION0620"
+)
+_ZCO059_FILTER_LOW = (
+    "wnd[1]/usr/ssub%_SUBSCREEN_FREESEL:SAPLSSEL:1105/ctxt%%DYN001-LOW"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +460,49 @@ def conectar_sap(sistema: dict, logger: logging.Logger):
             return None
 
     return session
+
+
+# ---------------------------------------------------------------------------
+# UTILITÁRIO DE ESPERA DE CONTROLE SAP
+# ---------------------------------------------------------------------------
+
+def esperar_controle(
+    session,
+    control_id: str,
+    timeout: float = 15.0,
+    intervalo: float = 0.4,
+    logger: logging.Logger = None,
+) -> bool:
+    """
+    Aguarda até que o controle SAP identificado por *control_id* esteja
+    disponível, evitando o erro 619 ("The control could not be found by id").
+
+    Estratégia:
+      - Chama session.findById(control_id, False) em loop (retorna None se não
+        encontrado, sem lançar exceção).
+      - Repete a cada *intervalo* segundos até *timeout* segundos.
+
+    Retorna True se o controle foi encontrado, False se ocorreu timeout.
+    Loga um aviso se o controle não aparecer dentro do timeout.
+    """
+    inicio = time.time()
+    while True:
+        try:
+            ctrl = session.findById(control_id, False)
+            if ctrl is not None:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        decorrido = time.time() - inicio
+        if decorrido >= timeout:
+            if logger:
+                logger.warning(
+                    "esperar_controle: timeout (%.1fs) aguardando '%s'.",
+                    timeout,
+                    control_id,
+                )
+            return False
+        time.sleep(intervalo)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,26 +1132,134 @@ def importar_tabela_de_arquivo(caminho_origem: str, tipo: str, pasta_tabelas: st
 
 def importar_zfit009_sap(session, pasta_tabelas: str, logger: logging.Logger):
     """
-    Importa ZFIT009 via SAP GUI Scripting (SE16) e salva em saidas/tabelas/ZFIT009.csv.
+    Importa ZFIT009 via SAP GUI Scripting (SE16) seguindo exatamente o VBS
+    gravado na sessão atual. Salva em saidas/tabelas/ZFIT009.csv.
+
+    Fluxo alinhado ao VBS:
+      maximize → SE16 → ZFIT009 → menu[3]/menu[0]/menu[1] → sendVKey 14 →
+      chk[1,5] + chk[1,11] → sendVKey 6 → sendVKey 8 (executar) →
+      sendVKey 20 (download) → sendVKey 0 → DY_PATH/DY_FILENAME →
+      btn[11] → 3× sendVKey 3
     """
     os.makedirs(pasta_tabelas, exist_ok=True)
     caminho = os.path.join(pasta_tabelas, "ZFIT009.csv")
+
+    # Passo 1 — Maximizar e abrir SE16
     try:
+        logger.info("ZFIT009 SAP [1/10]: maximizando janela e abrindo SE16.")
+        session.findById("wnd[0]").maximize()
         session.findById("wnd[0]/tbar[0]/okcd").Text = "se16"
         session.findById("wnd[0]").sendVKey(0)
+        esperar_controle(session, "wnd[0]/usr/ctxtDATABROWSE-TABLENAME", logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZFIT009 SAP [1/10 - SE16]: id=wnd[0]/tbar[0]/okcd | %s", exc
+        )
+        return None
+
+    # Passo 2 — Inserir nome da tabela e confirmar (Enter)
+    try:
+        logger.info("ZFIT009 SAP [2/10]: inserindo nome da tabela ZFIT009.")
         session.findById("wnd[0]/usr/ctxtDATABROWSE-TABLENAME").Text = "ZFIT009"
         session.findById("wnd[0]").sendVKey(0)
-        session.findById("wnd[0]").sendVKey(14)
+        esperar_controle(session, _ZFIT009_MENU_CAMPOS, logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZFIT009 SAP [2/10 - tabela]: id=wnd[0]/usr/ctxtDATABROWSE-TABLENAME | %s", exc
+        )
+        return None
+
+    # Passo 3 — Abrir configuração de campos via menu (menu[3]/menu[0]/menu[1])
+    try:
+        logger.info("ZFIT009 SAP [3/10]: abrindo config de campos (menu[3]/menu[0]/menu[1]).")
+        session.findById(_ZFIT009_MENU_CAMPOS).select()
+        esperar_controle(session, "wnd[1]", logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZFIT009 SAP [3/10 - menu campos]: id=%s | %s", _ZFIT009_MENU_CAMPOS, exc
+        )
+        return None
+
+    # Passo 4 — Navegar para seleção de campos (sendVKey 14 = F14)
+    try:
+        logger.info("ZFIT009 SAP [4/10]: navegando para seleção de campos (sendVKey 14).")
+        session.findById("wnd[1]").sendVKey(14)
+        esperar_controle(session, "wnd[1]/usr/chk[1,5]", logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZFIT009 SAP [4/10 - sendVKey 14]: id=wnd[1] | %s", exc
+        )
+        return None
+
+    # Passo 5 — Marcar checkboxes chk[1,5] e chk[1,11]
+    try:
+        logger.info("ZFIT009 SAP [5/10]: marcando chk[1,5] e chk[1,11].")
         session.findById("wnd[1]/usr/chk[1,5]").Selected = True
         session.findById("wnd[1]/usr/chk[1,11]").Selected = True
-        session.findById("wnd[1]").sendVKey(8)
-        session.findById("wnd[0]/mbar/menu[6]/menu[5]/menu[2]/menu[2]").Select()
+        session.findById("wnd[1]/usr/chk[1,11]").setFocus()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZFIT009 SAP [5/10 - checkboxes]: id=wnd[1]/usr/chk[1,5] | %s", exc
+        )
+        return None
+
+    # Passo 6 — Aplicar seleção de campos (sendVKey 6 = F6 / Enter na variante)
+    try:
+        logger.info("ZFIT009 SAP [6/10]: aplicando seleção de campos (sendVKey 6).")
+        session.findById("wnd[1]").sendVKey(6)
+        esperar_controle(session, "wnd[0]", logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZFIT009 SAP [6/10 - sendVKey 6]: id=wnd[1] | %s", exc
+        )
+        return None
+
+    # Passo 7 — Executar lista (sendVKey 8 = F8) e aguardar resultado
+    try:
+        logger.info("ZFIT009 SAP [7/10]: executando lista (sendVKey 8 = F8).")
+        session.findById("wnd[0]").sendVKey(8)
+        time.sleep(2)  # aguarda geração da lista
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZFIT009 SAP [7/10 - F8 executar]: sendVKey(8) | %s", exc
+        )
+        return None
+
+    # Passo 8 — Abrir diálogo de download (sendVKey 20)
+    try:
+        logger.info("ZFIT009 SAP [8/10]: abrindo diálogo de download (sendVKey 20).")
+        session.findById("wnd[0]").sendVKey(20)
+        esperar_controle(session, "wnd[1]", logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZFIT009 SAP [8/10 - sendVKey 20]: sendVKey(20) | %s", exc
+        )
+        return None
+
+    # Passo 9 — Confirmar tipo de arquivo (sendVKey 0 = Enter) e preencher caminho
+    try:
+        logger.info("ZFIT009 SAP [9/10]: confirmando formato e preenchendo caminho.")
+        session.findById("wnd[1]").sendVKey(0)
+        esperar_controle(session, "wnd[1]/usr/ctxtDY_PATH", logger=logger)
         session.findById("wnd[1]/usr/ctxtDY_PATH").Text = pasta_tabelas
         session.findById("wnd[1]/usr/ctxtDY_FILENAME").Text = "ZFIT009.csv"
-        session.findById("wnd[1]/tbar[0]/btn[11]").Press()
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = 11
+        session.findById("wnd[1]/tbar[0]/btn[11]").press()
+        logger.info("ZFIT009 SAP: arquivo exportado para '%s'.", caminho)
     except Exception as exc:  # noqa: BLE001
-        logger.error("Falha na importação SAP da ZFIT009: %s", exc)
+        logger.error(
+            "ZFIT009 SAP [9/10 - salvar]: id=wnd[1]/usr/ctxtDY_PATH | %s", exc
+        )
         return None
+
+    # Passo 10 — Fechar telas (3× sendVKey 3 = Voltar)
+    try:
+        logger.info("ZFIT009 SAP [10/10]: fechando telas (3× sendVKey 3).")
+        session.findById("wnd[0]").sendVKey(3)
+        session.findById("wnd[0]").sendVKey(3)
+        session.findById("wnd[0]").sendVKey(3)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ZFIT009 SAP [10/10 - fechar telas]: %s", exc)
 
     registros, cabecalho_encontrado = parse_tabela_pipe(caminho, "zfit009", logger)
     if not _validar_importacao_tabela(caminho, "zfit009", registros, cabecalho_encontrado, logger):
@@ -1092,26 +1269,121 @@ def importar_zfit009_sap(session, pasta_tabelas: str, logger: logging.Logger):
 
 def importar_zco059_sap(session, pasta_tabelas: str, logger: logging.Logger):
     """
-    Importa ZCO059 via SAP GUI Scripting e salva em saidas/tabelas/ZCO059.csv.
+    Importa ZCO059 via SAP GUI Scripting seguindo exatamente o VBS gravado
+    na sessão atual. Salva em saidas/tabelas/ZCO059.csv.
+
+    Fluxo alinhado ao VBS:
+      zco059 → ALV shell → &COL0 (col selection) → sequência btnAPP_FL_SING →
+      btn[0] (OK) → setCurrentCell/selectColumn CONSOLIDA →
+      &MB_FILTER → &FILTER → DYN001-LOW = "S" → btn[0] →
+      &MB_EXPORT → &PC → btn[0] → DY_PATH/DY_FILENAME → btn[11]
     """
     os.makedirs(pasta_tabelas, exist_ok=True)
     caminho = os.path.join(pasta_tabelas, "ZCO059.csv")
+
+    # Passo 1 — Abrir transação ZCO059 e aguardar ALV grid
     try:
+        logger.info("ZCO059 SAP [1]: abrindo transação ZCO059.")
         session.findById("wnd[0]/tbar[0]/okcd").Text = "zco059"
         session.findById("wnd[0]").sendVKey(0)
-        session.findById("wnd[0]/usr/cntlGRID1/shellcont/shell").pressToolbarButton("&COL0")
-        session.findById("wnd[0]/usr/cntlGRID1/shellcont/shell").selectColumn("CONSOLIDA")
-        session.findById("wnd[0]/usr/cntlGRID1/shellcont/shell").pressToolbarButton("&MB_FILTER")
-        session.findById("wnd[1]/usr/txtDYN001-LOW").Text = "S"
-        session.findById("wnd[1]/tbar[0]/btn[0]").Press()
-        session.findById("wnd[0]/usr/cntlGRID1/shellcont/shell").pressToolbarButton("&MB_EXPORT")
-        session.findById("wnd[1]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/radSPOPLI-SELFLAG[1,0]").Select()
-        session.findById("wnd[1]/tbar[0]/btn[0]").Press()
+        esperar_controle(session, _ZCO059_SHELL, timeout=20.0, logger=logger)
+        logger.debug("ZCO059 SAP: transação aberta; ALV shell localizado.")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZCO059 SAP [1 - transação]: id=wnd[0]/tbar[0]/okcd | %s", exc
+        )
+        return None
+
+    # Passo 2 — Seleção de colunas via &COL0 (não crítico; envolvido em try isolado)
+    try:
+        logger.info("ZCO059 SAP [2]: abrindo seleção de colunas (&COL0).")
+        session.findById(_ZCO059_SHELL).pressToolbarButton("&COL0")
+        esperar_controle(session, _ZCO059_COL_BTN, timeout=10.0, logger=logger)
+        btn = session.findById(_ZCO059_COL_BTN)
+        tbl = session.findById(_ZCO059_COL_TBL)
+
+        # Sequência exata do VBS:
+        # press; row=1+press; row=2+press; 7×press; row=3+press
+        btn.press()
+        tbl.currentCellRow = 1
+        btn.press()
+        tbl.currentCellRow = 2
+        btn.press()
+        for _ in range(7):
+            btn.press()
+        tbl.currentCellRow = 3
+        btn.press()
+
+        session.findById("wnd[1]/tbar[0]/btn[0]").press()
+        logger.debug("ZCO059 SAP: seleção de colunas concluída.")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ZCO059 SAP [2 - colunas]: %s — continuando sem seleção de colunas.", exc
+        )
+        # Tentar fechar o diálogo de colunas se ainda estiver aberto
+        try:
+            session.findById("wnd[1]/tbar[0]/btn[0]").press()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Passo 3 — Selecionar coluna CONSOLIDA e aplicar filtro
+    try:
+        logger.info("ZCO059 SAP [3]: selecionando coluna CONSOLIDA para filtro.")
+        shell = session.findById(_ZCO059_SHELL)
+        shell.setCurrentCell(-1, "CONSOLIDA")
+        shell.selectColumn("CONSOLIDA")
+        shell.pressToolbarContextButton("&MB_FILTER")
+        shell.selectContextMenuItem("&FILTER")
+        esperar_controle(session, _ZCO059_FILTER_LOW, logger=logger)
+        logger.debug("ZCO059 SAP: diálogo de filtro aberto.")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZCO059 SAP [3 - filtro]: id=%s | %s", _ZCO059_SHELL, exc
+        )
+        return None
+
+    # Passo 4 — Preencher filtro CONSOLIDA = "S" e confirmar
+    try:
+        logger.info("ZCO059 SAP [4]: preenchendo filtro CONSOLIDA='S'.")
+        session.findById(_ZCO059_FILTER_LOW).Text = "S"
+        session.findById(_ZCO059_FILTER_LOW).caretPosition = 1
+        session.findById("wnd[1]/tbar[0]/btn[0]").press()
+        esperar_controle(session, _ZCO059_SHELL, logger=logger)
+        logger.debug("ZCO059 SAP: filtro CONSOLIDA='S' aplicado.")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZCO059 SAP [4 - filtro S]: id=%s | %s", _ZCO059_FILTER_LOW, exc
+        )
+        return None
+
+    # Passo 5 — Exportar via &MB_EXPORT / &PC
+    try:
+        logger.info("ZCO059 SAP [5]: abrindo menu de exportação (&MB_EXPORT → &PC).")
+        shell = session.findById(_ZCO059_SHELL)
+        shell.pressToolbarContextButton("&MB_EXPORT")
+        shell.selectContextMenuItem("&PC")
+        esperar_controle(session, "wnd[1]/tbar[0]/btn[0]", logger=logger)
+        session.findById("wnd[1]/tbar[0]/btn[0]").press()
+        esperar_controle(session, "wnd[1]/usr/ctxtDY_PATH", logger=logger)
+        logger.debug("ZCO059 SAP: diálogo de caminho de exportação aberto.")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "ZCO059 SAP [5 - exportar]: id=%s | %s", _ZCO059_SHELL, exc
+        )
+        return None
+
+    # Passo 6 — Preencher caminho e nome do arquivo e salvar
+    try:
+        logger.info("ZCO059 SAP [6]: preenchendo caminho e nome do arquivo.")
         session.findById("wnd[1]/usr/ctxtDY_PATH").Text = pasta_tabelas
         session.findById("wnd[1]/usr/ctxtDY_FILENAME").Text = "ZCO059.csv"
-        session.findById("wnd[1]/tbar[0]/btn[11]").Press()
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = 10
+        session.findById("wnd[1]/tbar[0]/btn[11]").press()
+        logger.info("ZCO059 SAP: arquivo exportado para '%s'.", caminho)
     except Exception as exc:  # noqa: BLE001
-        logger.error("Falha na importação SAP da ZCO059: %s", exc)
+        logger.error(
+            "ZCO059 SAP [6 - salvar]: id=wnd[1]/usr/ctxtDY_PATH | %s", exc
+        )
         return None
 
     registros, cabecalho_encontrado = parse_tabela_pipe(caminho, "zco059", logger)
