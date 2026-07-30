@@ -93,12 +93,16 @@ IDX_ENTRADO   = 18
 IDX_ESTORNO   = 19
 IDX_DIAGREDE  = 20
 
-# Mapeamento de contas específicas para classificações
-# (usadas para identificar a natureza do lançamento pelo Nº doc.)
+# Contas específicas usadas na classificação (altere aqui se os números mudarem)
+CONTA_IOF   = "2104030007"   # IOF sobre operação de Mútuo
+CONTA_IRRF  = "1103050050"   # IRRF sobre rendimento de Mútuo
+CONTA_JUROS = "4401020004"   # Receita de juros de Mútuo
+
+# Mapeamento conta → classificação (prioridade: IOF > IRRF > Juros)
 CONTAS_CLASSIFICACAO = {
-    "2104030007": "IOF",
-    "1103050010": "IRRF",
-    "4401030001": "Rendimento",
+    CONTA_IOF:   "IOF",
+    CONTA_IRRF:  "IRRF",
+    CONTA_JUROS: "Juros",
 }
 
 # Prefixo das contas de Mútuo
@@ -262,15 +266,27 @@ def limpar_e_ordenar(linhas: list, logger: logging.Logger) -> list:
 
 def _parse_montante(valor_str: str):
     """
-    Converte string de montante no formato brasileiro (ex.: '1.234,56' ou
-    '-8.000,00 ') para float. Retorna None se não for possível converter.
+    Converte string de montante no formato brasileiro para float.
+
+    Formatos suportados:
+      '1.234,56'    → positivo
+      '-8.000,00'   → negativo (sinal à esquerda)
+      '3.301,24-'   → negativo (sinal à direita, padrão SAP FBL3N)
+
+    Retorna None se não for possível converter.
     """
     if not valor_str:
         return None
     try:
+        s = valor_str.strip()
+        # Sinal negativo à direita (ex.: '3.301,24-') — padrão SAP
+        negativo = s.endswith("-")
+        if negativo:
+            s = s[:-1].strip()
         # Remove separador de milhar (.) e substitui decimal (,) por (.)
-        limpo = valor_str.strip().replace(".", "").replace(",", ".")
-        return float(limpo)
+        limpo = s.replace(".", "").replace(",", ".")
+        valor = float(limpo)
+        return -valor if negativo else valor
     except (ValueError, AttributeError):
         return None
 
@@ -584,19 +600,67 @@ def iterar_periodo(
 # CONSOLIDAÇÃO
 # ---------------------------------------------------------------------------
 
-def _detectar_encoding(caminho: str) -> str:
+# Padrões típicos de mojibake (UTF-8 lido como latin-1)
+_MOJIBAKE_PATTERNS = ("Ã§", "Ã£", "Ãµ", "Ãº", "LÃ§", "Ã£o", "Ã§Ã£", "Ã©", "Ã³")
+
+
+def _tem_mojibake(texto: str) -> bool:
+    """Retorna True se o texto apresentar padrões típicos de duplo-encoding."""
+    return any(p in texto for p in _MOJIBAKE_PATTERNS)
+
+
+def _corrigir_mojibake(texto: str) -> str:
     """
-    Tenta detectar o encoding do arquivo testando encodings comuns.
-    Retorna o encoding identificado (padrão: 'latin-1').
+    Tenta corrigir duplo-encoding reinterpretando a string como latin-1 → utf-8.
+    Retorna o texto original se a correção falhar.
     """
-    for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+    try:
+        return texto.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return texto
+
+
+def ler_csv_corrigindo_encoding(caminho: str, logger: logging.Logger) -> list:
+    """
+    Lê um arquivo CSV detectando o encoding correto e corrigindo mojibake.
+
+    Estratégia:
+      1. Tenta utf-8-sig / utf-8 primeiro (formato mais comum nos CSVs SAP atuais).
+      2. Se falhar (UnicodeDecodeError) ou detectar padrões de mojibake, tenta
+         cp1252 / latin-1.
+      3. Se o conteúdo lido contiver padrões de mojibake (ex.: 'Ã§', 'Ã£'),
+         aplica correção reinterpretando bytes como latin-1 → utf-8.
+      4. Última alternativa: latin-1 com errors='replace'.
+
+    Retorna lista de strings (linhas sem \\r\\n) com encoding corrigido.
+    Loga o encoding detectado e se houve correção de mojibake.
+    """
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
-            with open(caminho, "r", encoding=enc) as f:
-                f.read()
-            return enc
-        except (UnicodeDecodeError, LookupError):
+            with open(caminho, "r", encoding=enc, errors="strict") as f:
+                linhas = [l.rstrip("\r\n") for l in f]
+            # Verifica mojibake na amostra inicial
+            amostra = " ".join(linhas[:30])
+            if _tem_mojibake(amostra):
+                linhas = [_corrigir_mojibake(l) for l in linhas]
+                logger.info(
+                    "Arquivo '%s': encoding=%s, mojibake detectado e corrigido.",
+                    caminho, enc,
+                )
+            else:
+                logger.debug(
+                    "Arquivo '%s': encoding=%s.", caminho, enc
+                )
+            return linhas
+        except UnicodeDecodeError:
             continue
-    return "latin-1"
+
+    # Última alternativa
+    logger.warning(
+        "Não foi possível ler '%s' sem erros; usando latin-1 com replace.", caminho
+    )
+    with open(caminho, "r", encoding="latin-1", errors="replace") as f:
+        return [l.rstrip("\r\n") for l in f]
 
 
 def consolidar(
@@ -634,19 +698,16 @@ def consolidar(
 
     todas_linhas = []
     for caminho_csv in sorted(csvs):  # ordem cronológica pelo nome do arquivo
-        enc = _detectar_encoding(caminho_csv)
-        logger.debug("Lendo '%s' com encoding '%s'.", caminho_csv, enc)
         try:
-            with open(caminho_csv, "r", encoding=enc, errors="replace") as entrada:
-                for linha in entrada:
-                    todas_linhas.append(linha.rstrip("\r\n"))
+            for linha in ler_csv_corrigindo_encoding(caminho_csv, logger):
+                todas_linhas.append(linha)
         except Exception as exc:  # noqa: BLE001
             logger.error("Erro ao ler '%s': %s", caminho_csv, exc)
 
     # Limpar (remover totais, separadores, cabeçalhos repetidos) e ordenar
     linhas_limpas = limpar_e_ordenar(todas_linhas, logger)
 
-    with open(caminho_consolidado, "w", encoding="utf-8", newline="") as saida:
+    with open(caminho_consolidado, "w", encoding="utf-8-sig", newline="") as saida:
         saida.write(CABECALHO_CONSOLIDADO + "\n")
         for linha in linhas_limpas:
             saida.write(linha + "\n")
@@ -663,25 +724,62 @@ def consolidar(
 # CLASSIFICAÇÃO
 # ---------------------------------------------------------------------------
 
-def classificar_natureza(campos: list) -> str:
+def indice_ndoc_por_conta(linhas_dados: list) -> dict:
     """
-    Determina a natureza do movimento de uma linha de Mútuo: 'Adições' ou 'Baixas'.
+    Constrói e retorna um dicionário mapeando cada Nº doc. ao conjunto de
+    contas em que ele aparece no conjunto de dados fornecido.
 
-    Heurística baseada no sinal do campo Montante Razão (índice IDX_MONTANTE):
-      - Valor positivo (débito na conta Mútuo)  → Adições
-      - Valor negativo (crédito na conta Mútuo) → Baixas
-
-    NOTA: Esta é uma heurística que pode precisar de ajuste após validação
-    com o usuário. No SAP FBL3N o sinal do montante representa débito (+) ou
-    crédito (-) na conta visualizada. Se a lógica de negócio indicar outra
-    convenção, basta inverter os retornos desta função.
+    Ex.: {'100123': {'1202060000', '2104030007'}, ...}
     """
-    if len(campos) > IDX_MONTANTE:
-        montante = _parse_montante(campos[IDX_MONTANTE])
-        if montante is not None:
-            return "Adições" if montante >= 0 else "Baixas"
-    # Fallback quando não é possível determinar pelo montante
-    return "Adições"
+    indice: dict = {}
+    for linha in linhas_dados:
+        campos = parse_linha(linha)
+        if len(campos) <= max(IDX_NRDOC, IDX_CONTA):
+            continue
+        nr = campos[IDX_NRDOC].strip()
+        conta = campos[IDX_CONTA].strip()
+        if nr:
+            indice.setdefault(nr, set()).add(conta)
+    return indice
+
+
+def classificar_linha(campos: list, indice_ndoc: dict) -> str:
+    """
+    Determina a classificação de uma linha de Mútuo (conta iniciando em '1202').
+
+    Regras em ordem de prioridade:
+      1. Se o Nº doc. também aparece na conta IOF  (2104030007) → 'IOF'
+      2. Se o Nº doc. também aparece na conta IRRF (1103050050) → 'IRRF'
+      3. Se o Nº doc. também aparece na conta Juros(4401020004) → 'Juros'
+      4. Senão, pelo campo CL da própria linha:
+           CL 09  → 'Adições'
+           CL 19  → 'Baixa'
+           outro  → '' (sem classificação; a chamada deve logar o CL)
+
+    Linhas de conta que não iniciem com '1202' devem ser filtradas antes de
+    chamar esta função.
+
+    Retorna a string de classificação ou '' se não for possível determinar.
+    """
+    if len(campos) <= IDX_CONTA:
+        return ""
+
+    nr = campos[IDX_NRDOC].strip() if len(campos) > IDX_NRDOC else ""
+    contas_do_doc = indice_ndoc.get(nr, set())
+
+    # Prioridade 1-3: vínculo por Nº doc. com contas especiais
+    for conta_ref in (CONTA_IOF, CONTA_IRRF, CONTA_JUROS):
+        if conta_ref in contas_do_doc:
+            return CONTAS_CLASSIFICACAO[conta_ref]
+
+    # Prioridade 4: campo CL da própria linha de Mútuo
+    cl = campos[IDX_CL].strip() if len(campos) > IDX_CL else ""
+    cl_norm = cl.zfill(2)  # normaliza '9' → '09' sem afetar '19'
+    if cl_norm == "09":
+        return "Adições"
+    if cl_norm == "19":
+        return "Baixa"
+    return ""  # CL desconhecido — quem chamou deve logar
 
 
 def classificar(
@@ -693,18 +791,15 @@ def classificar(
     Lê o arquivo consolidado e gera um arquivo classificado com a coluna
     'Classificação' acrescentada ao final de cada linha.
 
-    Regras de classificação para linhas de Mútuo (conta iniciando em '1202'):
-      1. Verifica em quais contas o mesmo Nº doc. aparece no conjunto de dados.
-         - Se o Nº doc. também aparece na conta 2104030007 → IOF
-         - Se o Nº doc. também aparece na conta 1103050010 → IRRF
-         - Se o Nº doc. também aparece na conta 4401030001 → Rendimento
-         (A prioridade é IOF > IRRF > Rendimento quando há múltiplos vínculos.)
-      2. Se não casa com nenhuma conta especial → classificar_natureza() decide
-         entre 'Adições' e 'Baixas' com base no sinal do Montante Razão.
+    Apenas as linhas de Mútuo (conta iniciando em '1202') recebem classificação.
+    As linhas de contrapartida (IOF/IRRF/Juros) servem como referência de
+    vínculo mas NÃO recebem classificação e não entram nos totais do resumo.
 
-    Linhas de contas especiais (IOF/IRRF/Rendimento) também recebem a
-    classificação correspondente para facilitar o Resumo.
-    Demais linhas ficam com Classificação vazia.
+    Regras de prioridade para linhas de Mútuo:
+      1. Nº doc. aparece em conta 2104030007 → IOF
+      2. Nº doc. aparece em conta 1103050050 → IRRF
+      3. Nº doc. aparece em conta 4401020004 → Juros
+      4. CL == 09 → Adições; CL == 19 → Baixa; outro → sem classificação (logado)
 
     Retorna o caminho do arquivo classificado, ou None em caso de falha.
     """
@@ -714,78 +809,54 @@ def classificar(
 
     os.makedirs(pasta_saida, exist_ok=True)
 
-    enc = _detectar_encoding(arquivo_consolidado)
-    logger.info(
-        "Classificando '%s' (encoding '%s')...", arquivo_consolidado, enc
-    )
+    logger.info("Classificando '%s'...", arquivo_consolidado)
 
-    # Leitura de todas as linhas de dados
+    # Leitura de todas as linhas de dados com correção de encoding
     linhas_dados = []
     cabecalho_original = None
     try:
-        with open(arquivo_consolidado, "r", encoding=enc, errors="replace") as f:
-            for linha in f:
-                linha = linha.rstrip("\r\n")
-                tp = tipo_de_linha(linha)
-                if tp == "cabecalho":
-                    cabecalho_original = linha
-                elif tp == "dado":
-                    linhas_dados.append(linha)
+        for linha in ler_csv_corrigindo_encoding(arquivo_consolidado, logger):
+            tp = tipo_de_linha(linha)
+            if tp == "cabecalho":
+                cabecalho_original = linha
+            elif tp == "dado":
+                linhas_dados.append(linha)
     except Exception as exc:  # noqa: BLE001
         logger.error("Erro ao ler consolidado para classificação: %s", exc)
         return None
 
-    # Construir índice Nº doc. → conjunto de contas
-    nrdoc_para_contas: dict = {}
-    for linha in linhas_dados:
-        campos = parse_linha(linha)
-        if len(campos) <= max(IDX_NRDOC, IDX_CONTA):
-            continue
-        nr = campos[IDX_NRDOC].strip()
-        conta = campos[IDX_CONTA].strip()
-        if nr:
-            nrdoc_para_contas.setdefault(nr, set()).add(conta)
+    # Construir índice Nº doc. → conjunto de contas (para prioridade 1-3)
+    nrdoc_para_contas = indice_ndoc_por_conta(linhas_dados)
 
-    # Ordem de prioridade para classificação por vínculo
-    _PRIORIDADE = ["2104030007", "1103050010", "4401030001"]
-
-    def _classificar_linha(campos: list) -> str:
-        if len(campos) <= IDX_CONTA:
-            return ""
-        conta = campos[IDX_CONTA].strip()
-
-        # Linhas de contas especiais recebem rótulo direto
-        if conta in CONTAS_CLASSIFICACAO:
-            return CONTAS_CLASSIFICACAO[conta]
-
-        # Linhas de Mútuo
-        if conta.startswith(PREFIXO_MUTUO):
-            nr = campos[IDX_NRDOC].strip() if len(campos) > IDX_NRDOC else ""
-            contas_do_doc = nrdoc_para_contas.get(nr, set())
-            for conta_ref in _PRIORIDADE:
-                if conta_ref in contas_do_doc:
-                    return CONTAS_CLASSIFICACAO[conta_ref]
-            # Sem vínculo especial → natureza do movimento
-            return classificar_natureza(campos)
-
-        return ""
-
-    # Aplicar classificação e contabilizar
+    # Contadores para LOG detalhado
     contagens: dict = {}
+    sem_classif_mutuo: list = []   # linhas de Mútuo sem classificação (CL desconhecido)
+    nao_mutuo_ignoradas: int = 0   # linhas fora de 1202*
+
     linhas_classificadas = []
-    sem_correspondencia = []
 
     for linha in linhas_dados:
         campos = parse_linha(linha)
-        classif = _classificar_linha(campos)
-        # Linha classificada: linha original + novo campo + delimitador final
-        linhas_classificadas.append(linha.rstrip("|") + "|" + classif + "|")
-        if classif:
-            contagens[classif] = contagens.get(classif, 0) + 1
-        else:
-            sem_correspondencia.append(linha[:80])
+        conta = campos[IDX_CONTA].strip() if len(campos) > IDX_CONTA else ""
 
-    # Nome do arquivo de saída: derivado do nome do consolidado
+        if conta.startswith(PREFIXO_MUTUO):
+            classif = classificar_linha(campos, nrdoc_para_contas)
+            if classif:
+                contagens[classif] = contagens.get(classif, 0) + 1
+            else:
+                cl = campos[IDX_CL].strip() if len(campos) > IDX_CL else "(ausente)"
+                nr = campos[IDX_NRDOC].strip() if len(campos) > IDX_NRDOC else ""
+                sem_classif_mutuo.append((nr, conta, cl))
+                logger.debug(
+                    "Mútuo sem classificação: Nº doc.=%s Conta=%s CL='%s'", nr, conta, cl
+                )
+        else:
+            classif = ""
+            nao_mutuo_ignoradas += 1
+
+        linhas_classificadas.append(linha.rstrip("|") + "|" + classif + "|")
+
+    # Nome do arquivo de saída
     data_ini_str, data_fim_str = _extrair_datas_do_nome(
         os.path.basename(arquivo_consolidado)
     )
@@ -797,18 +868,27 @@ def classificar(
         + "|Classificação|"
     )
 
-    with open(caminho_saida, "w", encoding="utf-8", newline="") as f:
+    with open(caminho_saida, "w", encoding="utf-8-sig", newline="") as f:
         f.write(cabecalho_saida + "\n")
         for linha in linhas_classificadas:
             f.write(linha + "\n")
 
     logger.info("Arquivo classificado gerado: '%s'", caminho_saida)
-    logger.info("Contagem por classificação: %s", contagens)
-    if sem_correspondencia:
-        logger.debug(
-            "%d linha(s) sem classificação (conta fora do escopo).",
-            len(sem_correspondencia),
-        )
+    logger.info(
+        "Contagem por classificação (linhas Mútuo): %s", contagens
+    )
+    logger.info(
+        "Linhas de Mútuo sem classificação (CL desconhecido): %d",
+        len(sem_classif_mutuo),
+    )
+    if sem_classif_mutuo:
+        for nr, conta, cl in sem_classif_mutuo[:20]:  # até 20 exemplos
+            logger.warning(
+                "  Mútuo sem classif → Nº doc.=%s Conta=%s CL='%s'", nr, conta, cl
+            )
+    logger.info(
+        "Linhas não-Mútuo ignoradas (sem classificação): %d", nao_mutuo_ignoradas
+    )
 
     return caminho_saida
 
@@ -816,6 +896,79 @@ def classificar(
 # ---------------------------------------------------------------------------
 # RESUMO
 # ---------------------------------------------------------------------------
+
+# Ordem fixa de exibição das categorias no resumo
+_ORDEM_RESUMO = ["Adições", "Juros", "IOF", "IRRF", "Baixa"]
+
+
+def exportar_resumo_xlsx(
+    caminho_xlsx: str,
+    categorias_ordenadas: list,
+    contagens: dict,
+    totais: dict,
+    total_geral_linhas: int,
+    total_geral_valor: float,
+    logger: logging.Logger,
+) -> None:
+    """
+    Exporta o resumo para Excel (.xlsx) usando openpyxl.
+
+    Formata o arquivo com:
+      - Cabeçalho em negrito.
+      - Larguras de coluna ajustadas.
+      - Valores monetários com formato numérico contábil.
+      - Linha de TOTAL GERAL em negrito ao final.
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, Alignment
+    except ImportError:
+        logger.error(
+            "openpyxl não instalado. Execute: pip install openpyxl"
+        )
+        return
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Resumo"
+
+    # Cabeçalho
+    ws.append(["Classificação", "Lançamentos", "Total Montante"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+    # Linhas de dados
+    for cat in categorias_ordenadas:
+        total = totais.get(cat, 0.0)
+        cnt = contagens.get(cat, 0)
+        ws.append([cat, cnt, total])
+
+    # Linha de total geral
+    ws.append(["TOTAL GERAL", total_geral_linhas, total_geral_valor])
+    ultima_linha = ws.max_row
+    for cell in ws[ultima_linha]:
+        cell.font = Font(bold=True)
+
+    # Larguras de coluna
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 20
+
+    # Formato numérico monetário para coluna C (linhas de dados + total)
+    fmt_numero = '#,##0.00'
+    for row in ws.iter_rows(min_row=2, max_row=ultima_linha, min_col=3, max_col=3):
+        for cell in row:
+            cell.number_format = fmt_numero
+
+    # Alinhamento: coluna B (Lançamentos) à direita
+    for row in ws.iter_rows(min_row=2, max_row=ultima_linha, min_col=2, max_col=2):
+        for cell in row:
+            cell.alignment = Alignment(horizontal="right")
+
+    wb.save(caminho_xlsx)
+    logger.info("Resumo Excel gerado: '%s'", caminho_xlsx)
+
 
 def gerar_resumo(
     arquivo_classificado: str,
@@ -826,12 +979,16 @@ def gerar_resumo(
     Lê o arquivo classificado e gera um resumo com totais de Montante Razão
     agrupados por Classificação.
 
+    Considera APENAS as 5 categorias (linhas de Mútuo classificadas):
+      Adições, Juros, IOF, IRRF, Baixa
+
     Saídas:
-      - Arquivo CSV de resumo em UTF-8.
+      - CSV de resumo em UTF-8-sig.
+      - Excel (.xlsx) via openpyxl com formatação contábil.
       - Impressão no terminal.
       - Registro no LOG.
 
-    Retorna o caminho do arquivo de resumo, ou None em caso de falha.
+    Retorna o caminho do arquivo CSV de resumo, ou None em caso de falha.
     """
     if not os.path.isfile(arquivo_classificado):
         logger.error("Arquivo classificado não encontrado: '%s'", arquivo_classificado)
@@ -839,81 +996,87 @@ def gerar_resumo(
 
     os.makedirs(pasta_saida, exist_ok=True)
 
-    enc = _detectar_encoding(arquivo_classificado)
-    logger.info(
-        "Gerando resumo de '%s' (encoding '%s')...", arquivo_classificado, enc
-    )
+    logger.info("Gerando resumo de '%s'...", arquivo_classificado)
 
     # Detectar índice da coluna Classificação a partir do cabeçalho
     idx_classif = None
-    idx_montante_resumo = IDX_MONTANTE  # padrão; recalculado se necessário
+    idx_montante_resumo = IDX_MONTANTE  # padrão; recalculado ao ler o cabeçalho
 
     totais: dict = {}
     contagens_linhas: dict = {}
 
     try:
-        with open(arquivo_classificado, "r", encoding=enc, errors="replace") as f:
-            for linha in f:
-                linha = linha.rstrip("\r\n")
-                tp = tipo_de_linha(linha)
+        for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
+            tp = tipo_de_linha(linha)
 
-                if tp == "cabecalho":
-                    campos = parse_linha(linha)
-                    for i, c in enumerate(campos):
-                        if "Classificação" in c or "Classificacao" in c:
-                            idx_classif = i
-                        if "Montante" in c:
-                            idx_montante_resumo = i
-                    continue
-
-                if tp != "dado":
-                    continue
-
+            if tp == "cabecalho":
                 campos = parse_linha(linha)
-                classif = ""
-                if idx_classif is not None and len(campos) > idx_classif:
-                    classif = campos[idx_classif].strip()
+                for i, c in enumerate(campos):
+                    if "Classificação" in c or "Classificacao" in c:
+                        idx_classif = i
+                    if "Montante" in c:
+                        idx_montante_resumo = i
+                continue
 
-                montante = None
-                if len(campos) > idx_montante_resumo:
-                    montante = _parse_montante(campos[idx_montante_resumo])
+            if tp != "dado":
+                continue
 
-                chave = classif if classif else "(sem classificação)"
-                totais[chave] = totais.get(chave, 0.0) + (montante or 0.0)
-                contagens_linhas[chave] = contagens_linhas.get(chave, 0) + 1
+            campos = parse_linha(linha)
+
+            # Somente linhas de Mútuo (1202*) entram nos totais
+            conta = campos[IDX_CONTA].strip() if len(campos) > IDX_CONTA else ""
+            if not conta.startswith(PREFIXO_MUTUO):
+                continue
+
+            classif = ""
+            if idx_classif is not None and len(campos) > idx_classif:
+                classif = campos[idx_classif].strip()
+
+            # Ignorar linhas de Mútuo sem classificação no resumo
+            if not classif:
+                continue
+
+            montante = None
+            if len(campos) > idx_montante_resumo:
+                montante = _parse_montante(campos[idx_montante_resumo])
+
+            totais[classif] = totais.get(classif, 0.0) + (montante or 0.0)
+            contagens_linhas[classif] = contagens_linhas.get(classif, 0) + 1
 
     except Exception as exc:  # noqa: BLE001
         logger.error("Erro ao ler arquivo classificado para resumo: %s", exc)
         return None
 
-    # Ordem preferida de exibição das categorias
-    _ORDEM = ["Adições", "Baixas", "IOF", "IRRF", "Rendimento"]
-    chaves_ordenadas = sorted(
-        totais.keys(),
-        key=lambda k: (_ORDEM.index(k) if k in _ORDEM else len(_ORDEM), k),
-    )
+    # Categorias na ordem fixa; inclui apenas as que têm dados
+    categorias_com_dados = [c for c in _ORDEM_RESUMO if c in totais]
 
-    total_geral = sum(totais.values())
-    total_linhas_geral = sum(contagens_linhas.values())
+    total_geral = sum(totais.get(c, 0.0) for c in categorias_com_dados)
+    total_linhas_geral = sum(contagens_linhas.get(c, 0) for c in categorias_com_dados)
+
+    # Formatar montante como string BR para exibição
+    def _fmt_br(valor: float) -> str:
+        abs_v = abs(valor)
+        s = f"{abs_v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"{s}-" if valor < 0 else s
 
     # Exibição no terminal e no LOG
-    separador = "-" * 60
+    separador = "-" * 62
     linhas_resumo = [
         separador,
         f"  RESUMO — {os.path.basename(arquivo_classificado)}",
         separador,
-        f"  {'Classificação':<25} {'Lançamentos':>12} {'Total Montante':>18}",
+        f"  {'Classificação':<20} {'Lançamentos':>12} {'Total Montante':>20}",
         separador,
     ]
-    for chave in chaves_ordenadas:
+    for chave in categorias_com_dados:
         linhas_resumo.append(
-            f"  {chave:<25} {contagens_linhas[chave]:>12}  "
-            f"{totais[chave]:>16.2f}"
+            f"  {chave:<20} {contagens_linhas[chave]:>12}  "
+            f"{_fmt_br(totais[chave]):>18}"
         )
     linhas_resumo += [
         separador,
-        f"  {'TOTAL GERAL':<25} {total_linhas_geral:>12}  "
-        f"{total_geral:>16.2f}",
+        f"  {'TOTAL GERAL':<20} {total_linhas_geral:>12}  "
+        f"{_fmt_br(total_geral):>18}",
         separador,
     ]
 
@@ -922,26 +1085,40 @@ def gerar_resumo(
     for l in linhas_resumo:
         logger.info(l)
 
-    # Gravar arquivo de resumo
+    # Derivar datas do nome do arquivo
     data_ini_str, data_fim_str = _extrair_datas_do_nome(
         os.path.basename(arquivo_classificado)
     )
-    nome_resumo = f"Resumo_{data_ini_str}_a_{data_fim_str}.csv"
-    caminho_resumo = os.path.join(pasta_saida, nome_resumo)
 
-    with open(caminho_resumo, "w", encoding="utf-8", newline="") as f:
+    # Gravar CSV de resumo
+    nome_resumo_csv = f"Resumo_{data_ini_str}_a_{data_fim_str}.csv"
+    caminho_resumo_csv = os.path.join(pasta_saida, nome_resumo_csv)
+
+    with open(caminho_resumo_csv, "w", encoding="utf-8-sig", newline="") as f:
         f.write("Classificação|Lançamentos|Total Montante\n")
-        for chave in chaves_ordenadas:
+        for chave in categorias_com_dados:
             f.write(
                 f"{chave}|{contagens_linhas[chave]}|"
-                f"{totais[chave]:.2f}\n"
+                f"{_fmt_br(totais[chave])}\n"
             )
-        f.write(
-            f"TOTAL GERAL|{total_linhas_geral}|{total_geral:.2f}\n"
-        )
+        f.write(f"TOTAL GERAL|{total_linhas_geral}|{_fmt_br(total_geral)}\n")
 
-    logger.info("Arquivo de resumo gerado: '%s'", caminho_resumo)
-    return caminho_resumo
+    logger.info("Arquivo CSV de resumo gerado: '%s'", caminho_resumo_csv)
+
+    # Gravar Excel de resumo
+    nome_resumo_xlsx = f"Resumo_{data_ini_str}_a_{data_fim_str}.xlsx"
+    caminho_resumo_xlsx = os.path.join(pasta_saida, nome_resumo_xlsx)
+    exportar_resumo_xlsx(
+        caminho_resumo_xlsx,
+        categorias_com_dados,
+        contagens_linhas,
+        totais,
+        total_linhas_geral,
+        total_geral,
+        logger,
+    )
+
+    return caminho_resumo_csv
 
 
 # ---------------------------------------------------------------------------
@@ -1017,27 +1194,80 @@ def _ler_sistema(logger: logging.Logger) -> dict:
         print(f"  ✗ {msg}")
 
 
-def _ler_arquivo(prompt: str, padrao: str, pasta: str, logger: logging.Logger) -> str:
+def selecionar_arquivo_entrada(
+    prompt: str, padrao: str, pasta: str, logger: logging.Logger
+) -> str:
     """
-    Solicita o caminho de um arquivo de entrada.
-    Apresenta o último arquivo encontrado como padrão; aceita Enter para usá-lo.
-    Valida que o arquivo existe antes de retornar.
+    Solicita o caminho de um arquivo de entrada com lógica robusta de resolução.
+
+    - Apresenta o arquivo mais recente como padrão (Enter para aceitar).
+    - Se o usuário digitar apenas o nome (com ou sem .csv), procura na 'pasta'.
+    - Se digitar um caminho absoluto, usa diretamente.
+    - Adiciona .csv automaticamente se o arquivo informado não tiver extensão.
+    - Valida existência antes de retornar.
     """
     ultimo = _encontrar_ultimo_arquivo(pasta, padrao)
     if ultimo:
-        prompt_completo = f"{prompt}\n  [padrão: {ultimo}]\n  Arquivo: "
+        nome_padrao = os.path.basename(ultimo)
+        prompt_completo = (
+            f"{prompt}\n"
+            f"  [padrão: {nome_padrao}]\n"
+            f"  (Enter para aceitar, ou informe nome/caminho): "
+        )
     else:
-        prompt_completo = f"{prompt}\n  Arquivo: "
+        prompt_completo = (
+            f"{prompt}\n"
+            f"  (nome do arquivo ou caminho completo): "
+        )
 
     while True:
         valor = input(prompt_completo).strip()
-        if not valor and ultimo:
-            return ultimo
-        if os.path.isfile(valor):
-            return valor
-        msg = f"Arquivo não encontrado: '{valor}'. Informe um caminho válido."
+
+        # Enter → usar padrão
+        if not valor:
+            if ultimo:
+                logger.info("Arquivo padrão selecionado: '%s'", ultimo)
+                return ultimo
+            print("  ✗ Nenhum arquivo disponível como padrão. Informe o caminho.")
+            continue
+
+        # Determinar candidato(s) a testar
+        candidatos = []
+
+        if os.path.isabs(valor):
+            # Caminho absoluto: usar como está (+ .csv se sem extensão)
+            if not os.path.splitext(valor)[1]:
+                candidatos.append(valor + ".csv")
+            candidatos.append(valor)
+        else:
+            # Nome simples ou relativo: procurar na pasta de saída
+            nome = valor
+            if not os.path.splitext(nome)[1]:
+                nome_csv = nome + ".csv"
+                candidatos.append(os.path.join(pasta, nome_csv))
+            candidatos.append(os.path.join(pasta, nome))
+            # Também testar no diretório atual como fallback
+            if not os.path.splitext(nome)[1]:
+                candidatos.append(nome + ".csv")
+            candidatos.append(nome)
+
+        for c in candidatos:
+            if os.path.isfile(c):
+                logger.info("Arquivo selecionado: '%s'", c)
+                return c
+
+        msg = (
+            f"Arquivo não encontrado: '{valor}'. "
+            f"Procurado em: '{pasta}' e diretório atual. "
+            "Informe o nome ou caminho completo."
+        )
         logger.warning(msg)
         print(f"  ✗ {msg}")
+        if pasta:
+            print(f"  Dica: arquivos disponíveis em '{pasta}':")
+            disponiveis = glob.glob(os.path.join(pasta, padrao))
+            for arq in sorted(disponiveis)[-5:]:
+                print(f"    • {os.path.basename(arq)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1100,7 +1330,7 @@ def _executar_classificar(logger: logging.Logger, caminho_log: str) -> None:
     print("  Classificar Consolidado")
     print("=" * 60)
 
-    arq = _ler_arquivo(
+    arq = selecionar_arquivo_entrada(
         "Arquivo consolidado a classificar",
         "Consolidado_*.csv",
         PASTA_CONSOLIDADO,
@@ -1124,7 +1354,7 @@ def _executar_resumo(logger: logging.Logger, caminho_log: str) -> None:
     print("  Resumo do Classificado")
     print("=" * 60)
 
-    arq = _ler_arquivo(
+    arq = selecionar_arquivo_entrada(
         "Arquivo classificado para gerar o resumo",
         "Classificado_*.csv",
         PASTA_CONSOLIDADO,
