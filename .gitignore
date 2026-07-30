@@ -1,6 +1,7 @@
 # Dados extraídos e gerados pelo script (não versionados)
 saidas/
 logs/
+saldo_inicial.json
 
 # Arquivos CSV e LOG gerados em qualquer pasta
 *.csv
