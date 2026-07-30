@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import datetime, timedelta
 from getpass import getuser
@@ -146,18 +147,29 @@ _ZFIT009_MENU_CAMPOS = "wnd[0]/mbar/menu[3]/menu[0]/menu[1]"
 _ZCO059_SHELL = (
     "wnd[0]/usr/subSUB_DRE:ZCOR043:0100/cntlCCONTAINER_1/shellcont/shell"
 )
+_ZCO059_COL_PREFIX = (
+    "wnd[1]/usr/tabsG_TS_ALV/tabpALV_M_R1/"
+    "ssubSUB_CONFIGURATION:SAPLSALV_CUL_COLUMN_SELECTION:0620/"
+)
 _ZCO059_COL_BTN = (
-    "wnd[1]/usr/tabsG_TS_ALV/tabpALV_M_R1"
-    "/ssubSUB_CONFIGURATION:SAPLSALV_CUL_COLUMN_SELECTION:0620/btnAPP_FL_SING"
+    _ZCO059_COL_PREFIX + "btnAPP_FL_SING"
 )
-_ZCO059_COL_TBL = (
-    "wnd[1]/usr/tabsG_TS_ALV/tabpALV_M_R1"
-    "/ssubSUB_CONFIGURATION:SAPLSALV_CUL_COLUMN_SELECTION:0620"
-    "/tblSAPLSALV_CUL_COLUMN_SELECTION0620"
+_ZCO059_COL_SHELL = (
+    _ZCO059_COL_PREFIX + "cntlCONTAINER2_LAYO/shellcont/shell"
 )
+_ZCO059_COL_OK = "wnd[1]/tbar[0]/btn[0]"
 _ZCO059_FILTER_LOW = (
     "wnd[1]/usr/ssub%_SUBSCREEN_FREESEL:SAPLSSEL:1105/ctxt%%DYN001-LOW"
 )
+_ZCO059_DIVISAO_RE = re.compile(r"[A-Z0-9]{2,10}")
+_ZCO059_DESCRICOES_ERRADAS = {
+    "SPE CONTROLADA",
+    "INDIVIDUAL",
+    "EMPRESA CONTROLADA",
+    "SCP CONTROLADA",
+    "URBAMAIS",
+    "MC",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1037,167 @@ def _linha_pipe_separador(partes: list) -> bool:
     return all(not p.strip().replace("-", "").strip() for p in com_conteudo)
 
 
+def _normalizar_rotulo_tabela(valor: str) -> str:
+    """Normaliza rótulos de colunas SAP para comparações tolerantes a encoding."""
+    valor = (valor or "").strip().upper()
+    valor = _corrigir_mojibake(valor)
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", valor)
+        if not unicodedata.combining(ch)
+    )
+
+
+def _partes_tabela_pipe(linha: str) -> list:
+    """Retorna as colunas de uma linha delimitada por pipe, com trim."""
+    texto = linha.strip()
+    if not texto or "|" not in texto:
+        return []
+    if texto.startswith("|") and texto.endswith("|"):
+        return [p.strip() for p in linha.split("|")[1:-1]]
+    return [p.strip() for p in linha.split("|")]
+
+
+def _linha_errada_zco059(empresa: str, divisao: str, consolida: str) -> bool:
+    """Detecta o export incorreto da ZCO059 sem seleção obrigatória de colunas."""
+    empresa_norm = _normalizar_rotulo_tabela(empresa)
+    divisao_norm = _normalizar_rotulo_tabela(divisao)
+    consolida_norm = _normalizar_rotulo_tabela(consolida)
+    return (
+        consolida_norm == "SIM"
+        and divisao_norm == "S"
+        and empresa_norm in _ZCO059_DESCRICOES_ERRADAS
+    )
+
+
+def parse_zco059(caminho: str, logger: logging.Logger) -> tuple:
+    """
+    Faz parse robusto da ZCO059 nos formatos aceitos:
+      - largura fixa delimitada por '|' exportada pelo VBS;
+      - CSV simples normalizado com cabeçalho Empresa|Divisão|Consolida.
+
+    Rejeita explicitamente o export incorreto sem seleção de colunas do ALV.
+    Retorna (registros, cabecalho_encontrado, erro_validacao).
+    """
+    registros = []
+    cabecalho_encontrado = False
+    erro_validacao = None
+    linhas_ignoradas = 0
+
+    for numero_linha, linha in enumerate(ler_csv_corrigindo_encoding(caminho, logger), start=1):
+        texto = linha.strip()
+        if not texto:
+            continue
+
+        partes = _partes_tabela_pipe(linha)
+        if not partes:
+            continue
+        if _linha_pipe_separador(partes):
+            continue
+
+        partes_norm = [_normalizar_rotulo_tabela(p) for p in partes[:3]]
+        if (
+            len(partes_norm) >= 3
+            and partes_norm[0] == "EMPRESA"
+            and partes_norm[1].startswith("DIVIS")
+            and partes_norm[2] == "CONSOLIDA"
+        ):
+            cabecalho_encontrado = True
+            continue
+
+        if len(partes) < 3:
+            linhas_ignoradas += 1
+            logger.debug("ZCO059: linha %d ignorada por ter menos de 3 colunas.", numero_linha)
+            continue
+
+        empresa = _corrigir_mojibake(partes[0].strip())
+        divisao = _corrigir_mojibake(partes[1].strip()).upper()
+        consolida = _corrigir_mojibake(partes[2].strip()).upper()
+
+        if _linha_errada_zco059(empresa, divisao, consolida):
+            erro_validacao = (
+                "ZCO059 com colunas inesperadas — a seleção de colunas do ALV "
+                "não foi aplicada; refaça a importação ou exporte via VBS."
+            )
+            logger.error(
+                "ZCO059: linha %d indica export incorreto sem seleção de colunas: %s",
+                numero_linha,
+                "|".join(partes[:3]),
+            )
+            return [], cabecalho_encontrado, erro_validacao
+
+        if not empresa and not divisao and not consolida:
+            continue
+        if not _ZCO059_DIVISAO_RE.fullmatch(divisao):
+            linhas_ignoradas += 1
+            logger.debug(
+                "ZCO059: linha %d ignorada por Divisão inválida ('%s').",
+                numero_linha,
+                divisao,
+            )
+            continue
+        if consolida not in {"", "N", "S"}:
+            linhas_ignoradas += 1
+            logger.debug(
+                "ZCO059: linha %d ignorada por Consolida inválido ('%s').",
+                numero_linha,
+                consolida,
+            )
+            continue
+
+        registros.append(
+            {"Empresa": empresa, "Divisão": divisao, "Consolida": consolida}
+        )
+
+    logger.info(
+        "ZCO059: %d linha(s) válidas carregadas; %d linha(s) ignoradas.",
+        len(registros),
+        linhas_ignoradas,
+    )
+    return registros, cabecalho_encontrado, erro_validacao
+
+
+def validar_zco059(
+    caminho: str,
+    registros: list,
+    cabecalho_encontrado: bool,
+    erro_validacao: str,
+    logger: logging.Logger,
+) -> bool:
+    """Valida a ZCO059 já parseada e garante colunas corretas para a consolidação."""
+    if not os.path.isfile(caminho):
+        logger.error("Arquivo ZCO059 não encontrado: '%s'", caminho)
+        return False
+    if erro_validacao:
+        logger.error(erro_validacao)
+        return False
+    if not cabecalho_encontrado:
+        logger.error("Cabeçalho esperado não encontrado em '%s' (ZCO059).", caminho)
+        return False
+    if not registros:
+        logger.error("Nenhuma linha válida encontrada em '%s' (ZCO059).", caminho)
+        return False
+
+    divisoes = {item["Divisão"] for item in registros if item["Divisão"]}
+    invalidos = [
+        item for item in registros
+        if not _ZCO059_DIVISAO_RE.fullmatch(item["Divisão"])
+        or item["Consolida"] not in {"", "N", "S"}
+    ]
+    if invalidos:
+        logger.error(
+            "ZCO059 inválida: %d linha(s) fora do padrão de Divisão/Consolida.",
+            len(invalidos),
+        )
+        return False
+
+    logger.info(
+        "ZCO059 validada com sucesso: %d linha(s) válidas e %d divisões únicas.",
+        len(registros),
+        len(divisoes),
+    )
+    return True
+
+
 def parse_tabela_pipe(caminho: str, tipo: str, logger: logging.Logger) -> tuple:
     """
     Faz parse robusto de tabela SAP largura-fixa delimitada por '|'.
@@ -1033,6 +1206,10 @@ def parse_tabela_pipe(caminho: str, tipo: str, logger: logging.Logger) -> tuple:
     - tipo='zfit009' → [{'Cliente': '2200000404', 'Divisão': 'A001'}, ...]
     - tipo='zco059'  → [{'Empresa': 'MRVH', 'Divisão': 'A001', 'Consolida': 'S'}, ...]
     """
+    if tipo == "zco059":
+        registros, cabecalho_encontrado, _ = parse_zco059(caminho, logger)
+        return registros, cabecalho_encontrado
+
     registros = []
     cabecalho_encontrado = False
 
@@ -1041,11 +1218,8 @@ def parse_tabela_pipe(caminho: str, tipo: str, logger: logging.Logger) -> tuple:
         if not texto:
             continue
 
-        if texto.startswith("|"):
-            partes = [p.strip() for p in linha.split("|")[1:-1]]
-        elif "|" in texto:
-            partes = [p.strip() for p in linha.split("|")]
-        else:
+        partes = _partes_tabela_pipe(linha)
+        if not partes:
             continue
 
         if _linha_pipe_separador(partes):
@@ -1063,20 +1237,6 @@ def parse_tabela_pipe(caminho: str, tipo: str, logger: logging.Logger) -> tuple:
             if not re.fullmatch(r"\d{10}", cliente):
                 continue
             registros.append({"Cliente": cliente, "Divisão": divisao})
-        elif tipo == "zco059":
-            if "EMPRESA" in linha_norm and ("DIVIS" in linha_norm or "DIVISÃ" in linha_norm):
-                cabecalho_encontrado = True
-                continue
-            if len(partes) < 3:
-                continue
-            empresa = partes[-3].strip()
-            divisao = partes[-2].strip()
-            consolida = partes[-1].strip().upper()
-            if not empresa and not divisao and not consolida:
-                continue
-            registros.append(
-                {"Empresa": empresa, "Divisão": divisao, "Consolida": consolida}
-            )
 
     return registros, cabecalho_encontrado
 
@@ -1085,6 +1245,8 @@ def _validar_importacao_tabela(
     caminho: str, tipo: str, registros: list, cabecalho_encontrado: bool, logger: logging.Logger
 ) -> bool:
     """Valida existência, cabeçalho e volume de dados importados."""
+    if tipo == "zco059":
+        return validar_zco059(caminho, registros, cabecalho_encontrado, None, logger)
     if not os.path.isfile(caminho):
         logger.error("Arquivo %s não encontrado: '%s'", tipo.upper(), caminho)
         return False
@@ -1124,8 +1286,25 @@ def _salvar_tabela_normalizada(tipo: str, registros: list, pasta_tabelas: str, l
 
 def importar_tabela_de_arquivo(caminho_origem: str, tipo: str, pasta_tabelas: str, logger: logging.Logger):
     """Importa ZFIT009/ZCO059 a partir de arquivo já exportado manualmente."""
-    registros, cabecalho_encontrado = parse_tabela_pipe(caminho_origem, tipo, logger)
-    if not _validar_importacao_tabela(caminho_origem, tipo, registros, cabecalho_encontrado, logger):
+    if tipo == "zco059":
+        registros, cabecalho_encontrado, erro_validacao = parse_zco059(caminho_origem, logger)
+        valido = validar_zco059(
+            caminho_origem,
+            registros,
+            cabecalho_encontrado,
+            erro_validacao,
+            logger,
+        )
+    else:
+        registros, cabecalho_encontrado = parse_tabela_pipe(caminho_origem, tipo, logger)
+        valido = _validar_importacao_tabela(
+            caminho_origem,
+            tipo,
+            registros,
+            cabecalho_encontrado,
+            logger,
+        )
+    if not valido:
         return None
     return _salvar_tabela_normalizada(tipo, registros, pasta_tabelas, logger)
 
@@ -1267,6 +1446,102 @@ def importar_zfit009_sap(session, pasta_tabelas: str, logger: logging.Logger):
     return _salvar_tabela_normalizada("zfit009", registros, pasta_tabelas, logger)
 
 
+def _fechar_popup_zco059(session, logger: logging.Logger) -> None:
+    """Fecha o popup de colunas da ZCO059, se ainda estiver aberto."""
+    try:
+        botao_ok = session.findById(_ZCO059_COL_OK, False)
+        if botao_ok is not None:
+            botao_ok.press()
+            time.sleep(0.3)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ZCO059 SAP: falha ao fechar popup de colunas: %s", exc)
+
+
+def _selecionar_colunas_zco059(session, logger: logging.Logger, tentativas: int = 3) -> bool:
+    """
+    Executa a seleção obrigatória de colunas do ALV da ZCO059 com retry.
+
+    A sequência replica o VBS gravado na sessão atual. Se falhar após todas as
+    tentativas, a importação deve ser abortada para evitar export incorreto.
+    """
+    for tentativa in range(1, tentativas + 1):
+        try:
+            logger.info(
+                "ZCO059 SAP [2]: tentativa %d/%d de seleção de colunas do ALV.",
+                tentativa,
+                tentativas,
+            )
+            if not esperar_controle(session, _ZCO059_SHELL, timeout=20.0, logger=logger):
+                raise RuntimeError("ALV principal não disponível antes do &COL0.")
+
+            shell = session.findById(_ZCO059_SHELL)
+            logger.debug("ZCO059 SAP [2]: ALV principal pronto; acionando &COL0.")
+            shell.pressToolbarButton("&COL0")
+            time.sleep(1.2)
+
+            if not esperar_controle(session, _ZCO059_COL_BTN, timeout=15.0, logger=logger):
+                raise RuntimeError("Popup de colunas não apareceu após &COL0.")
+
+            def _botao_colunas():
+                if not esperar_controle(session, _ZCO059_COL_BTN, timeout=10.0, logger=logger):
+                    raise RuntimeError("Botão btnAPP_FL_SING indisponível.")
+                return session.findById(_ZCO059_COL_BTN)
+
+            def _grid_colunas():
+                if not esperar_controle(session, _ZCO059_COL_SHELL, timeout=10.0, logger=logger):
+                    raise RuntimeError("Grid do popup de colunas indisponível.")
+                return session.findById(_ZCO059_COL_SHELL)
+
+            logger.debug("ZCO059 SAP [2]: popup de colunas pronto; replicando sequência do VBS.")
+            _botao_colunas().press()
+            time.sleep(0.3)
+
+            _grid_colunas().currentCellRow = 1
+            logger.debug("ZCO059 SAP [2]: currentCellRow = 1.")
+            time.sleep(0.2)
+            _botao_colunas().press()
+            time.sleep(0.3)
+
+            _grid_colunas().currentCellRow = 2
+            logger.debug("ZCO059 SAP [2]: currentCellRow = 2.")
+            time.sleep(0.2)
+            _botao_colunas().press()
+            time.sleep(0.3)
+
+            for indice in range(7):
+                _botao_colunas().press()
+                logger.debug("ZCO059 SAP [2]: press adicional %d/7 em btnAPP_FL_SING.", indice + 1)
+                time.sleep(0.2)
+
+            _grid_colunas().currentCellRow = 3
+            logger.debug("ZCO059 SAP [2]: currentCellRow = 3.")
+            time.sleep(0.2)
+            _botao_colunas().press()
+            time.sleep(0.3)
+
+            if not esperar_controle(session, _ZCO059_COL_OK, timeout=10.0, logger=logger):
+                raise RuntimeError("Botão OK do popup de colunas indisponível.")
+            session.findById(_ZCO059_COL_OK).press()
+            time.sleep(0.5)
+            logger.info("ZCO059 SAP [2]: seleção obrigatória de colunas concluída com sucesso.")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ZCO059 SAP [2 - colunas]: tentativa %d/%d falhou: %s",
+                tentativa,
+                tentativas,
+                exc,
+            )
+            _fechar_popup_zco059(session, logger)
+            time.sleep(1.0)
+
+    logger.error(
+        "Seleção de colunas do ALV falhou; exporte manualmente via ZCO059.vbs "
+        "e use a opção de importar por arquivo."
+    )
+    return False
+
+
 def importar_zco059_sap(session, pasta_tabelas: str, logger: logging.Logger):
     """
     Importa ZCO059 via SAP GUI Scripting seguindo exatamente o VBS gravado
@@ -1279,7 +1554,7 @@ def importar_zco059_sap(session, pasta_tabelas: str, logger: logging.Logger):
       &MB_EXPORT → &PC → btn[0] → DY_PATH/DY_FILENAME → btn[11]
     """
     os.makedirs(pasta_tabelas, exist_ok=True)
-    caminho = os.path.join(pasta_tabelas, "ZCO059.csv")
+    caminho_tmp = os.path.join(pasta_tabelas, "ZCO059__sap_tmp.csv")
 
     # Passo 1 — Abrir transação ZCO059 e aguardar ALV grid
     try:
@@ -1294,37 +1569,9 @@ def importar_zco059_sap(session, pasta_tabelas: str, logger: logging.Logger):
         )
         return None
 
-    # Passo 2 — Seleção de colunas via &COL0 (não crítico; envolvido em try isolado)
-    try:
-        logger.info("ZCO059 SAP [2]: abrindo seleção de colunas (&COL0).")
-        session.findById(_ZCO059_SHELL).pressToolbarButton("&COL0")
-        esperar_controle(session, _ZCO059_COL_BTN, timeout=10.0, logger=logger)
-        btn = session.findById(_ZCO059_COL_BTN)
-        tbl = session.findById(_ZCO059_COL_TBL)
-
-        # Sequência exata do VBS:
-        # press; row=1+press; row=2+press; 7×press; row=3+press
-        btn.press()
-        tbl.currentCellRow = 1
-        btn.press()
-        tbl.currentCellRow = 2
-        btn.press()
-        for _ in range(7):
-            btn.press()
-        tbl.currentCellRow = 3
-        btn.press()
-
-        session.findById("wnd[1]/tbar[0]/btn[0]").press()
-        logger.debug("ZCO059 SAP: seleção de colunas concluída.")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "ZCO059 SAP [2 - colunas]: %s — continuando sem seleção de colunas.", exc
-        )
-        # Tentar fechar o diálogo de colunas se ainda estiver aberto
-        try:
-            session.findById("wnd[1]/tbar[0]/btn[0]").press()
-        except Exception:  # noqa: BLE001
-            pass
+    # Passo 2 — Seleção obrigatória de colunas via &COL0
+    if not _selecionar_colunas_zco059(session, logger):
+        return None
 
     # Passo 3 — Selecionar coluna CONSOLIDA e aplicar filtro
     try:
@@ -1376,19 +1623,33 @@ def importar_zco059_sap(session, pasta_tabelas: str, logger: logging.Logger):
     try:
         logger.info("ZCO059 SAP [6]: preenchendo caminho e nome do arquivo.")
         session.findById("wnd[1]/usr/ctxtDY_PATH").Text = pasta_tabelas
-        session.findById("wnd[1]/usr/ctxtDY_FILENAME").Text = "ZCO059.csv"
-        session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = 10
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").Text = os.path.basename(caminho_tmp)
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = len(os.path.basename(caminho_tmp))
         session.findById("wnd[1]/tbar[0]/btn[11]").press()
-        logger.info("ZCO059 SAP: arquivo exportado para '%s'.", caminho)
+        logger.info("ZCO059 SAP: arquivo temporário exportado para '%s'.", caminho_tmp)
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "ZCO059 SAP [6 - salvar]: id=wnd[1]/usr/ctxtDY_PATH | %s", exc
         )
         return None
 
-    registros, cabecalho_encontrado = parse_tabela_pipe(caminho, "zco059", logger)
-    if not _validar_importacao_tabela(caminho, "zco059", registros, cabecalho_encontrado, logger):
+    registros, cabecalho_encontrado, erro_validacao = parse_zco059(caminho_tmp, logger)
+    if not validar_zco059(
+        caminho_tmp,
+        registros,
+        cabecalho_encontrado,
+        erro_validacao,
+        logger,
+    ):
+        try:
+            os.remove(caminho_tmp)
+        except OSError:
+            pass
         return None
+    try:
+        os.remove(caminho_tmp)
+    except OSError:
+        logger.debug("ZCO059 SAP: arquivo temporário não pôde ser removido: '%s'.", caminho_tmp)
     return _salvar_tabela_normalizada("zco059", registros, pasta_tabelas, logger)
 
 
@@ -1398,8 +1659,25 @@ def carregar_tabela_normalizada(tipo: str, pasta_tabelas: str, logger: logging.L
     if not os.path.isfile(caminho):
         logger.error("Tabela %s não encontrada em '%s'.", tipo.upper(), caminho)
         return None
-    registros, cabecalho_encontrado = parse_tabela_pipe(caminho, tipo, logger)
-    if not _validar_importacao_tabela(caminho, tipo, registros, cabecalho_encontrado, logger):
+    if tipo == "zco059":
+        registros, cabecalho_encontrado, erro_validacao = parse_zco059(caminho, logger)
+        valido = validar_zco059(
+            caminho,
+            registros,
+            cabecalho_encontrado,
+            erro_validacao,
+            logger,
+        )
+    else:
+        registros, cabecalho_encontrado = parse_tabela_pipe(caminho, tipo, logger)
+        valido = _validar_importacao_tabela(
+            caminho,
+            tipo,
+            registros,
+            cabecalho_encontrado,
+            logger,
+        )
+    if not valido:
         return None
     return registros
 
@@ -1423,6 +1701,12 @@ def gerar_consolidacao(pasta_tabelas: str, pasta_consolidado: str, logger: loggi
             divisao_consolida[divisao] = "S"
         elif divisao not in divisao_consolida:
             divisao_consolida[divisao] = valor
+
+    logger.info(
+        "ZCO059 carregada para consolidação: %d linhas, %d divisões únicas.",
+        len(zco),
+        len(divisao_consolida),
+    )
 
     por_cliente = defaultdict(set)
     divisao_vazia = 0
