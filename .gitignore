@@ -1,8 +1,12 @@
-# Arquivos gerados pela extração
+# Dados extraídos e gerados pelo script (não versionados)
+saidas/
+logs/
+
+# Arquivos CSV e LOG gerados em qualquer pasta
 *.csv
 MUTDFC_log_*.txt
 
-# Pasta de trabalho padrão (caso criada dentro do repo)
+# Pasta de trabalho legada (caso exista de versão anterior)
 MUTDFC_Extracao/
 
 # Python
