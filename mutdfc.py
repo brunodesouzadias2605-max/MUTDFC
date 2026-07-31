@@ -143,7 +143,7 @@ AJUSTES_INICIAIS = {
 }
 
 # Colunas removidas da saída final (Classificado CSV + Excel)
-COLUNAS_REMOVER_SAIDA = {"St", "Atribuição", "Imobilizado", "DiagRede"}
+COLUNAS_REMOVER_SAIDA = {"St", "Atribuição", "Imobilizado", "DiagRede", "Status Consolidação"}
 
 # Contas de contrapartida movidas para auditoria após classificação
 CONTAS_CONTRAPARTIDA_AUDITORIA = {CONTA_JUROS, CONTA_IRRF, CONTA_IOF}
@@ -1099,11 +1099,25 @@ def _linha_errada_zco059(empresa: str, divisao: str, consolida: str) -> bool:
     )
 
 
+def _transformar_descricao_zco059(descricao: str) -> str:
+    """
+    Transforma a descrição da ZCO059 em 'Individual' ou 'Controladas'.
+    "Individual" → Individual; qualquer outro → Controladas.
+    """
+    descricao_norm = descricao.strip().upper()
+    if descricao_norm == "INDIVIDUAL":
+        return "Individual"
+    return "Controladas"
+
+
 def parse_zco059(caminho: str, logger: logging.Logger) -> tuple:
     """
     Faz parse robusto da ZCO059 nos formatos aceitos:
       - largura fixa delimitada por '|' exportada pelo VBS;
-      - CSV simples normalizado com cabeçalho Empresa|Divisão|Consolida.
+      - CSV simples normalizado com cabeçalho Empresa|Divisão|Descrição|Consolida.
+
+    Inclui a coluna Descrição que é transformada em estrutura de consolidação:
+      "Individual" → Individual; qualquer outro → Controladas.
 
     Rejeita explicitamente o export incorreto sem seleção de colunas do ALV.
     Retorna (registros, cabecalho_encontrado, erro_validacao).
@@ -1112,6 +1126,7 @@ def parse_zco059(caminho: str, logger: logging.Logger) -> tuple:
     cabecalho_encontrado = False
     erro_validacao = None
     linhas_ignoradas = 0
+    tem_descricao = False  # Flag para detectar formato com 4 colunas
 
     for numero_linha, linha in enumerate(ler_csv_corrigindo_encoding(caminho, logger), start=1):
         texto = linha.strip()
@@ -1124,24 +1139,43 @@ def parse_zco059(caminho: str, logger: logging.Logger) -> tuple:
         if _linha_pipe_separador(partes):
             continue
 
-        partes_norm = [_normalizar_rotulo_tabela(p) for p in partes[:3]]
-        if (
-            len(partes_norm) >= 3
-            and partes_norm[0] == "EMPRESA"
-            and partes_norm[1].startswith("DIVIS")
-            and partes_norm[2] == "CONSOLIDA"
-        ):
-            cabecalho_encontrado = True
-            continue
+        # Verificar cabeçalho — aceita formato com 3 ou 4 colunas
+        partes_norm = [_normalizar_rotulo_tabela(p) for p in partes[:4] if p.strip()]
+        if len(partes_norm) >= 3 and partes_norm[0] == "EMPRESA" and partes_norm[1].startswith("DIVIS"):
+            # Formato com 4 colunas: Empresa|Divisão|Descrição|Consolida
+            if len(partes_norm) >= 4 and "DESCRI" in partes_norm[2] and partes_norm[3] == "CONSOLIDA":
+                cabecalho_encontrado = True
+                tem_descricao = True
+                continue
+            # Formato com 3 colunas: Empresa|Divisão|Consolida (retrocompatível)
+            if partes_norm[2] == "CONSOLIDA":
+                cabecalho_encontrado = True
+                tem_descricao = False
+                continue
 
-        if len(partes) < 3:
-            linhas_ignoradas += 1
-            logger.debug("ZCO059: linha %d ignorada por ter menos de 3 colunas.", numero_linha)
-            continue
+        # Processar linhas de dados
+        if tem_descricao:
+            # Formato com 4 colunas: Empresa|Divisão|Descrição|Consolida
+            if len(partes) < 4:
+                linhas_ignoradas += 1
+                logger.debug("ZCO059: linha %d ignorada por ter menos de 4 colunas.", numero_linha)
+                continue
 
-        empresa = _corrigir_mojibake(partes[0].strip())
-        divisao = _corrigir_mojibake(partes[1].strip()).upper()
-        consolida = _corrigir_mojibake(partes[2].strip()).upper()
+            empresa = _corrigir_mojibake(partes[0].strip())
+            divisao = _corrigir_mojibake(partes[1].strip()).upper()
+            descricao_raw = _corrigir_mojibake(partes[2].strip())
+            consolida = _corrigir_mojibake(partes[3].strip()).upper()
+        else:
+            # Formato com 3 colunas: Empresa|Divisão|Consolida (retrocompatível)
+            if len(partes) < 3:
+                linhas_ignoradas += 1
+                logger.debug("ZCO059: linha %d ignorada por ter menos de 3 colunas.", numero_linha)
+                continue
+
+            empresa = _corrigir_mojibake(partes[0].strip())
+            divisao = _corrigir_mojibake(partes[1].strip()).upper()
+            descricao_raw = ""
+            consolida = _corrigir_mojibake(partes[2].strip()).upper()
 
         if _linha_errada_zco059(empresa, divisao, consolida):
             erro_validacao = (
@@ -1151,7 +1185,7 @@ def parse_zco059(caminho: str, logger: logging.Logger) -> tuple:
             logger.error(
                 "ZCO059: linha %d indica export incorreto sem seleção de colunas: %s",
                 numero_linha,
-                "|".join(partes[:3]),
+                "|".join(partes[:4]),
             )
             return [], cabecalho_encontrado, erro_validacao
 
@@ -1174,8 +1208,11 @@ def parse_zco059(caminho: str, logger: logging.Logger) -> tuple:
             )
             continue
 
+        # Transformar descrição: "Individual"→Individual; outro→Controladas
+        descricao = _transformar_descricao_zco059(descricao_raw) if descricao_raw else "Controladas"
+
         registros.append(
-            {"Empresa": empresa, "Divisão": divisao, "Consolida": consolida}
+            {"Empresa": empresa, "Divisão": divisao, "Descrição": descricao, "Consolida": consolida}
         )
 
     logger.info(
@@ -1306,9 +1343,11 @@ def _salvar_tabela_normalizada(tipo: str, registros: list, pasta_tabelas: str, l
             for item in registros:
                 f.write(f"{item['Cliente']}|{item['Divisão']}\n")
         else:
-            f.write("Empresa|Divisão|Consolida\n")
+            # ZCO059 com 4 colunas: Empresa|Divisão|Descrição|Consolida
+            f.write("Empresa|Divisão|Descrição|Consolida\n")
             for item in registros:
-                f.write(f"{item['Empresa']}|{item['Divisão']}|{item['Consolida']}\n")
+                descricao = item.get("Descrição", "Controladas")
+                f.write(f"{item['Empresa']}|{item['Divisão']}|{descricao}|{item['Consolida']}\n")
 
     logger.info("Tabela %s salva em '%s'.", tipo.upper(), caminho)
     return caminho
@@ -1715,27 +1754,30 @@ def carregar_tabela_normalizada(tipo: str, pasta_tabelas: str, logger: logging.L
 def gerar_consolidacao(pasta_tabelas: str, pasta_consolidado: str, logger: logging.Logger):
     """
     Gera Consolidacao_Cliente_Divisao_Consolida.csv a partir de ZFIT009 e ZCO059.
+    Inclui a coluna Descrição (Estrutura de Consolidação: Individual/Controladas).
     """
     zfit = carregar_tabela_normalizada("zfit009", pasta_tabelas, logger)
     zco = carregar_tabela_normalizada("zco059", pasta_tabelas, logger)
     if zfit is None or zco is None:
         return None
 
-    divisao_consolida = {}
+    # Mapear Divisão → (Consolida, Descrição) da ZCO059
+    divisao_info = {}
     for item in zco:
         divisao = item["Divisão"].strip()
         if not divisao:
             continue
         valor = item["Consolida"].strip().upper()
+        descricao = item.get("Descrição", "Controladas")
         if valor == "S":
-            divisao_consolida[divisao] = "S"
-        elif divisao not in divisao_consolida:
-            divisao_consolida[divisao] = valor
+            divisao_info[divisao] = ("S", descricao)
+        elif divisao not in divisao_info:
+            divisao_info[divisao] = (valor, descricao)
 
     logger.info(
         "ZCO059 carregada para consolidação: %d linhas, %d divisões únicas.",
         len(zco),
-        len(divisao_consolida),
+        len(divisao_info),
     )
 
     por_cliente = defaultdict(set)
@@ -1747,8 +1789,10 @@ def gerar_consolidacao(pasta_tabelas: str, pasta_consolidado: str, logger: loggi
         por_cliente[cliente].add(divisao)
         if not divisao:
             divisao_vazia += 1
-        consolida = "S" if divisao and divisao_consolida.get(divisao, "") == "S" else ""
-        linhas_saida.append((cliente, divisao, consolida))
+        info = divisao_info.get(divisao, ("", "Controladas"))
+        consolida = "S" if divisao and info[0] == "S" else ""
+        descricao = info[1] if divisao else "Controladas"
+        linhas_saida.append((cliente, divisao, descricao, consolida))
 
     clientes_ambiguos = {c: sorted(v) for c, v in por_cliente.items() if len(v) > 1}
     if clientes_ambiguos:
@@ -1764,12 +1808,12 @@ def gerar_consolidacao(pasta_tabelas: str, pasta_consolidado: str, logger: loggi
         "Consolidacao_Cliente_Divisao_Consolida.csv",
     )
     with open(caminho_saida, "w", encoding="utf-8-sig", newline="") as f:
-        f.write("Cliente|Divisão|Consolida\n")
-        for cliente, divisao, consolida in linhas_saida:
-            f.write(f"{cliente}|{divisao}|{consolida}\n")
+        f.write("Cliente|Divisão|Descrição|Consolida\n")
+        for cliente, divisao, descricao, consolida in linhas_saida:
+            f.write(f"{cliente}|{divisao}|{descricao}|{consolida}\n")
 
     logger.info(
-        "Consolidação Cliente→Divisão→Consolida gerada: '%s' (%d linhas).",
+        "Consolidação Cliente→Divisão→Descrição→Consolida gerada: '%s' (%d linhas).",
         caminho_saida,
         len(linhas_saida),
     )
@@ -1783,16 +1827,16 @@ def aplicar_status_consolidacao(
     logger: logging.Logger,
 ):
     """
-    Adiciona colunas Destino, Consolida e Status Consolidação ao classificado.
+    Adiciona colunas Destino, Consolida e Estrutura de Consolidação ao classificado.
 
     Alterações em relação à versão anterior:
-    - Coluna renomeada de "Divisão" para "Destino" (item 2).
+    - Coluna renomeada de "Divisão" para "Destino".
     - Destino determinado por resolver_destino() com precedência:
-        (a) Conta específica  (b) 120206*→Parceiro
-        (c) ajuste_manual.json  (d) ZFIT009
-    - Consolida usa "S"/"N" — nunca vazio (item 4).
-    - Status Consolidação usa "S"/"N" (era "Elimina"/"Não Consolida") (item 4).
-    - Gera TXT 'SemDestino_*' com linhas sem Destino (item 2).
+        (a) Conta específica  (b) Ajuste manual  (c) 120206*→Parceiro  (d) ZFIT009
+    - Consolida usa "S"/"N" — buscado via Destino na Divisão da tabela de consolidação.
+    - Removida coluna "Status Consolidação" (mantém só "Consolida").
+    - Nova coluna "Estrutura de Consolidação" (Individual/Controladas) via ZCO059.
+    - Gera TXT 'SemDestino_*' com linhas sem Destino.
     """
     if not os.path.isfile(arquivo_classificado):
         logger.error("Arquivo classificado não encontrado: '%s'", arquivo_classificado)
@@ -1801,8 +1845,9 @@ def aplicar_status_consolidacao(
         logger.error("Arquivo de consolidação não encontrado: '%s'", arquivo_consolidacao)
         return None
 
-    # Carrega de-para cliente→(divisao, consolida) da tabela de consolidação
-    idx_consolida = {}
+    # Carrega de-para cliente→(divisao, descricao, consolida) e divisao→(descricao, consolida)
+    idx_consolida = {}       # cliente → [(divisao, consolida), ...]
+    divisao_info = {}        # divisao → (descricao, consolida)
     for linha in ler_csv_corrigindo_encoding(arquivo_consolidacao, logger):
         texto = linha.strip()
         if not texto:
@@ -1813,22 +1858,34 @@ def aplicar_status_consolidacao(
             partes = [p.strip() for p in linha.split("|")[1:-1]]
         else:
             partes = [p.strip() for p in linha.split("|")]
-        if len(partes) < 3:
-            continue
-        cliente, divisao, consolida = partes[0], partes[1], partes[2].upper()
+        # Formato: Cliente|Divisão|Descrição|Consolida
+        if len(partes) < 4:
+            # Retrocompatibilidade com formato de 3 colunas
+            if len(partes) >= 3:
+                cliente, divisao, consolida = partes[0], partes[1], partes[2].upper()
+                descricao = "Controladas"
+            else:
+                continue
+        else:
+            cliente, divisao, descricao, consolida = partes[0], partes[1], partes[2], partes[3].upper()
         idx_consolida.setdefault(cliente, []).append((divisao, consolida))
+        if divisao and divisao not in divisao_info:
+            divisao_info[divisao] = (descricao, consolida)
+        elif divisao and consolida == "S":
+            # Se já existe, priorizar S
+            divisao_info[divisao] = (descricao, consolida)
 
-    # Carrega ajustes manuais (prioridade sobre ZFIT009)
+    # Carrega ajustes manuais (prioridade sobre Parceiro e ZFIT009)
     ajustes_manuais = carregar_ajustes_manuais(logger)
 
     linhas_saida = []
     linhas_sem_destino = []   # linhas que não obtiveram Destino
 
-    # Contadores por regra de Destino (item 2 — LOG detalhado)
+    # Contadores por regra de Destino
     contadores_destino = {
         "conta_especifica": 0,
-        "parceiro": 0,
         "ajuste_manual": 0,
+        "parceiro": 0,
         "zfit009": 0,
         "sem_destino": 0,
     }
@@ -1851,7 +1908,8 @@ def aplicar_status_consolidacao(
                     idx_conta_dyn = i
                 if cn == "cliente":
                     idx_cliente_dyn = i
-            cabecalho_saida = linha.rstrip("|") + "|Destino|Consolida|Status Consolidação|"
+            # Novo cabeçalho: Destino|Consolida|Estrutura de Consolidação (sem Status Consolidação)
+            cabecalho_saida = linha.rstrip("|") + "|Destino|Consolida|Estrutura de Consolidação|"
             continue
         if tp != "dado":
             continue
@@ -1860,24 +1918,27 @@ def aplicar_status_consolidacao(
         conta = campos[idx_conta_dyn].strip() if len(campos) > idx_conta_dyn else ""
         cliente = campos[idx_cliente_dyn].strip() if len(campos) > idx_cliente_dyn else ""
 
-        # Resolve Destino com precedência explícita (item 2)
+        # Resolve Destino com precedência: Conta específica → Ajuste manual → Parceiro → ZFIT009
         destino, regra = resolver_destino(conta, cliente, ajustes_manuais, idx_consolida)
         contadores_destino[regra] = contadores_destino.get(regra, 0) + 1
 
-        # Determine Consolida ("S"/"N") pela tabela de consolidação (item 4)
-        correspondencias = idx_consolida.get(cliente, [])
-        if correspondencias and any(c == "S" for _, c in correspondencias):
+        # Consolida por Destino: buscar Destino na coluna Divisão da consolidação
+        # Se houver múltiplos destinos (separados por ;), usar o primeiro
+        destino_principal = destino.split(";")[0].strip() if destino else ""
+        info = divisao_info.get(destino_principal, ("Controladas", ""))
+        estrutura = info[0] if info[0] else "Controladas"
+        consolida_divisao = info[1]
+
+        if consolida_divisao == "S":
             consolida = "S"
-            status = "S"
             consolida_s += 1
         else:
             consolida = "N"
-            status = "N"
             consolida_n += 1
 
-        linhas_saida.append(linha.rstrip("|") + f"|{destino}|{consolida}|{status}|")
+        linhas_saida.append(linha.rstrip("|") + f"|{destino}|{consolida}|{estrutura}|")
 
-        # Coleta linha sem Destino para TXT (item 2)
+        # Coleta linha sem Destino para TXT
         if not destino:
             nr = campos[IDX_NRDOC].strip() if len(campos) > IDX_NRDOC else ""
             cl = campos[IDX_CL].strip() if len(campos) > IDX_CL else ""
@@ -1891,7 +1952,7 @@ def aplicar_status_consolidacao(
     caminho_saida = os.path.join(pasta_saida, os.path.basename(arquivo_classificado))
     cab_fallback = (
         CABECALHO_CONSOLIDADO.rstrip("|")
-        + "|Classificação|Destino|Consolida|Status Consolidação|"
+        + "|Classificação|Destino|Consolida|Estrutura de Consolidação|"
     )
     with open(caminho_saida, "w", encoding="utf-8-sig", newline="") as f:
         f.write((cabecalho_saida or cab_fallback) + "\n")
@@ -1900,20 +1961,20 @@ def aplicar_status_consolidacao(
 
     logger.info("Status consolidação aplicado em '%s'.", caminho_saida)
     logger.info(
-        "Destino — por Conta específica: %d | Parceiro: %d | "
-        "Ajuste manual: %d | ZFIT009: %d | Sem Destino: %d",
+        "Destino — por Conta específica: %d | Ajuste manual: %d | "
+        "Parceiro: %d | ZFIT009: %d | Sem Destino: %d",
         contadores_destino["conta_especifica"],
-        contadores_destino["parceiro"],
         contadores_destino["ajuste_manual"],
+        contadores_destino["parceiro"],
         contadores_destino["zfit009"],
         contadores_destino["sem_destino"],
     )
     logger.info(
-        "Consolida: S=%d | N=%d | Status Consolidação: S=%d | N=%d",
-        consolida_s, consolida_n, consolida_s, consolida_n,
+        "Consolida (por Destino): S=%d | N=%d",
+        consolida_s, consolida_n,
     )
 
-    # Gera TXT com linhas sem Destino (item 2)
+    # Gera TXT com linhas sem Destino
     qtd_sem = contadores_destino["sem_destino"]
     if qtd_sem:
         logger.warning(
@@ -2300,31 +2361,31 @@ def resolver_destino(
     Resolve o Destino de uma linha de movimentação com a seguinte precedência:
 
     (a) De-para por Conta — prioridade máxima (CONTAS_DESTINO_POR_CONTA).
-    (b) Prefixo 120206* (≠1202060000 e não consta nas específicas de (a))
+    (b) Ajuste manual por Cliente (ajustes_manuais.json) — sobrepõe Parceiro e ZFIT009.
+    (c) Prefixo 120206* (≠1202060000 e não consta nas específicas de (a))
         → Destino = "Parceiro".
-    (c) Ajuste manual por Cliente (ajustes_manuais.json) — sobrepõe ZFIT009.
     (d) ZFIT009 por Cliente (via tabela de consolidação carregada).
 
     Retorna (destino: str, regra: str) onde regra é uma das strings:
-        'conta_especifica' | 'parceiro' | 'ajuste_manual' | 'zfit009' | 'sem_destino'
+        'conta_especifica' | 'ajuste_manual' | 'parceiro' | 'zfit009' | 'sem_destino'
     """
     # (a) Conta com mapeamento explícito
     destino_conta = CONTAS_DESTINO_POR_CONTA.get(conta)
     if destino_conta:
         return destino_conta, "conta_especifica"
 
-    # (b) Prefixo 120206* exceto a conta base e as já mapeadas em (a)
+    # (b) Ajuste manual por Cliente (tem prioridade sobre Parceiro e ZFIT009)
+    vinculos = ajustes_manuais.get("vinculos", {}) if isinstance(ajustes_manuais, dict) else {}
+    if cliente and cliente in vinculos:
+        return vinculos[cliente], "ajuste_manual"
+
+    # (c) Prefixo 120206* exceto a conta base e as já mapeadas em (a)
     if (
         conta.startswith(PREFIXO_MUTUO_LONGO)
         and conta != CONTA_MUTUO_BASE
         and conta not in CONTAS_DESTINO_POR_CONTA
     ):
         return "Parceiro", "parceiro"
-
-    # (c) Ajuste manual por Cliente (tem prioridade sobre ZFIT009)
-    vinculos = ajustes_manuais.get("vinculos", {}) if isinstance(ajustes_manuais, dict) else {}
-    if cliente and cliente in vinculos:
-        return vinculos[cliente], "ajuste_manual"
 
     # (d) ZFIT009 via tabela de consolidação
     correspondencias = idx_consolida.get(cliente, [])
@@ -2353,7 +2414,23 @@ def calcular_saldo_final_fluxo(
 
 
 def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logging.Logger):
-    """Gera resumo de fluxo (CSV + Excel) com Saldo Inicial e Saldo Final."""
+    """
+    Gera resumo de fluxo (CSV + Excel) segregado por estrutura de consolidação.
+    
+    Estrutura:
+        Etapa | Individual | Controladas | Consolidado
+        Saldo Inicial | ... | ... | ...
+        Adições | ... | ... | ...
+        (-) Eliminações | ... | ... | ...
+        Juros | ... | ... | ...
+        IOF | ... | ... | ...
+        IRRF | ... | ... | ...
+        Baixas | ... | ... | ...
+        Saldo Final | ... | ... | ...
+        
+    Eliminações = soma das linhas com Consolida="S" (todas as classificações),
+    apresentadas com sinal invertido.
+    """
     if not os.path.isfile(arquivo_classificado):
         logger.error("Arquivo classificado não encontrado: '%s'", arquivo_classificado)
         return None
@@ -2373,14 +2450,18 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
     ).strip() or periodo_default or "não informado"
     salvar_saldo_inicial(saldo_inicial, periodo, logger)
 
-    totais = {"Adições": 0.0, "Juros": 0.0, "IOF": 0.0, "IRRF": 0.0, "Baixa": 0.0}
-    eliminacoes = 0.0
+    # Totais segregados por estrutura: Individual e Controladas
+    totais_individual = {"Adições": 0.0, "Juros": 0.0, "IOF": 0.0, "IRRF": 0.0, "Baixa": 0.0}
+    totais_controladas = {"Adições": 0.0, "Juros": 0.0, "IOF": 0.0, "IRRF": 0.0, "Baixa": 0.0}
+    eliminacoes_individual = 0.0
+    eliminacoes_controladas = 0.0
     elimina_linhas = 0
 
     idx_classif = None
-    idx_status = None
+    idx_consolida = None
+    idx_estrutura = None
     idx_montante = IDX_MONTANTE
-    idx_conta = IDX_CONTA  # detectado dinamicamente do cabeçalho (item 5)
+    idx_conta = IDX_CONTA
 
     for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
         tp = tipo_de_linha(linha)
@@ -2390,8 +2471,10 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
                 c_norm = c.strip().lower()
                 if "classificação" in c_norm or "classificacao" in c_norm:
                     idx_classif = i
-                if "status consolidação" in c_norm or "status consolidacao" in c_norm:
-                    idx_status = i
+                if c_norm == "consolida":
+                    idx_consolida = i
+                if "estrutura" in c_norm:
+                    idx_estrutura = i
                 if "montante" in c_norm:
                     idx_montante = i
                 if c_norm == "conta":
@@ -2408,33 +2491,66 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
         classif = campos[idx_classif].strip() if idx_classif is not None and len(campos) > idx_classif else ""
         montante = _parse_montante(campos[idx_montante]) if len(campos) > idx_montante else 0.0
         montante = montante or 0.0
+        
+        consolida = campos[idx_consolida].strip() if idx_consolida is not None and len(campos) > idx_consolida else ""
+        estrutura = campos[idx_estrutura].strip() if idx_estrutura is not None and len(campos) > idx_estrutura else "Controladas"
+        
+        # Determinar qual dicionário de totais usar
+        if estrutura == "Individual":
+            totais = totais_individual
+        else:
+            totais = totais_controladas
+        
         if classif in totais:
             totais[classif] += montante
 
-        status = campos[idx_status].strip() if idx_status is not None and len(campos) > idx_status else ""
-        # "S" é o novo rótulo de eliminação (era "Elimina") — item 4
-        if status == "S":
-            eliminacoes += montante
+        # Eliminações = soma de linhas com Consolida="S" (todas as classificações)
+        if consolida == "S":
+            if estrutura == "Individual":
+                eliminacoes_individual += montante
+            else:
+                eliminacoes_controladas += montante
             elimina_linhas += 1
 
-    adicoes = totais.get("Adições", 0.0)
-    juros = totais.get("Juros", 0.0)
-    iof = totais.get("IOF", 0.0)
-    irrf = totais.get("IRRF", 0.0)
-    baixas = totais.get("Baixa", 0.0)
-    saldo_final = calcular_saldo_final_fluxo(
-        saldo_inicial, adicoes, eliminacoes, juros, iof, irrf, baixas
+    # Calcular saldo final para cada estrutura
+    adicoes_ind = totais_individual.get("Adições", 0.0)
+    juros_ind = totais_individual.get("Juros", 0.0)
+    iof_ind = totais_individual.get("IOF", 0.0)
+    irrf_ind = totais_individual.get("IRRF", 0.0)
+    baixas_ind = totais_individual.get("Baixa", 0.0)
+    saldo_final_ind = calcular_saldo_final_fluxo(
+        saldo_inicial, adicoes_ind, eliminacoes_individual, juros_ind, iof_ind, irrf_ind, baixas_ind
     )
 
+    adicoes_ctrl = totais_controladas.get("Adições", 0.0)
+    juros_ctrl = totais_controladas.get("Juros", 0.0)
+    iof_ctrl = totais_controladas.get("IOF", 0.0)
+    irrf_ctrl = totais_controladas.get("IRRF", 0.0)
+    baixas_ctrl = totais_controladas.get("Baixa", 0.0)
+    saldo_final_ctrl = calcular_saldo_final_fluxo(
+        0.0, adicoes_ctrl, eliminacoes_controladas, juros_ctrl, iof_ctrl, irrf_ctrl, baixas_ctrl
+    )
+
+    # Consolidado = Individual + Controladas
+    adicoes_cons = adicoes_ind + adicoes_ctrl
+    eliminacoes_cons = eliminacoes_individual + eliminacoes_controladas
+    juros_cons = juros_ind + juros_ctrl
+    iof_cons = iof_ind + iof_ctrl
+    irrf_cons = irrf_ind + irrf_ctrl
+    baixas_cons = baixas_ind + baixas_ctrl
+    saldo_final_cons = saldo_final_ind + saldo_final_ctrl
+
+    # Estrutura do resumo segregado: (Etapa, Individual, Controladas, Consolidado)
+    # Eliminações apresentadas com sinal invertido
     linhas_fluxo = [
-        ("Saldo Inicial", saldo_inicial),
-        ("Adições", adicoes),
-        ("(-) Eliminações", eliminacoes),
-        ("Juros", juros),
-        ("IOF", iof),
-        ("IRRF", irrf),
-        ("Baixas", baixas),
-        ("Saldo Final", saldo_final),
+        ("Saldo Inicial", saldo_inicial, 0.0, saldo_inicial),
+        ("Adições", adicoes_ind, adicoes_ctrl, adicoes_cons),
+        ("(-) Eliminações", -eliminacoes_individual, -eliminacoes_controladas, -eliminacoes_cons),
+        ("Juros", juros_ind, juros_ctrl, juros_cons),
+        ("IOF", iof_ind, iof_ctrl, iof_cons),
+        ("IRRF", irrf_ind, irrf_ctrl, irrf_cons),
+        ("Baixas", baixas_ind, baixas_ctrl, baixas_cons),
+        ("Saldo Final", saldo_final_ind, saldo_final_ctrl, saldo_final_cons),
     ]
 
     data_ini_str, data_fim_str = _extrair_datas_do_nome(os.path.basename(arquivo_classificado))
@@ -2443,19 +2559,21 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
     os.makedirs(pasta_saida, exist_ok=True)
 
     with open(caminho_csv, "w", encoding="utf-8-sig", newline="") as f:
-        f.write("Etapa|Valor\n")
-        for etapa, valor in linhas_fluxo:
-            f.write(f"{etapa}|{_formatar_valor_br(valor)}\n")
+        f.write("Etapa|Individual|Controladas|Consolidado\n")
+        for etapa, ind, ctrl, cons in linhas_fluxo:
+            f.write(f"{etapa}|{_formatar_valor_br(ind)}|{_formatar_valor_br(ctrl)}|{_formatar_valor_br(cons)}\n")
 
     caminho_xlsx = os.path.join(pasta_saida, f"Resumo_{data_ini_str}_a_{data_fim_str}.xlsx")
     exportar_resumo_fluxo_xlsx(caminho_xlsx, linhas_fluxo, logger)
 
-    separador = "-" * 62
+    separador = "-" * 90
     print(separador)
     print(f"  RESUMO FLUXO — {os.path.basename(arquivo_classificado)}")
     print(separador)
-    for etapa, valor in linhas_fluxo:
-        print(f"  {etapa:<20} {_formatar_valor_br(valor):>20}")
+    print(f"  {'Etapa':<20} {'Individual':>20} {'Controladas':>20} {'Consolidado':>20}")
+    print(separador)
+    for etapa, ind, ctrl, cons in linhas_fluxo:
+        print(f"  {etapa:<20} {_formatar_valor_br(ind):>20} {_formatar_valor_br(ctrl):>20} {_formatar_valor_br(cons):>20}")
     print(separador)
 
     logger.info("Resumo fluxo gerado em '%s' e '%s'.", caminho_csv, caminho_xlsx)
@@ -2464,10 +2582,19 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
 
 
 def exportar_resumo_fluxo_xlsx(caminho_xlsx: str, linhas_fluxo: list, logger: logging.Logger):
-    """Exporta resumo de fluxo para Excel com destaque de saldos."""
+    """
+    Exporta resumo de fluxo segregado para Excel com formatação corporativa.
+    
+    Formatação:
+    - Cabeçalho verde com texto branco em negrito
+    - Saldo Inicial e Saldo Final em negrito destacados
+    - IRRF e Baixas em vermelho
+    - Formato monetário BR
+    - Faixa laranja de separação antes do Saldo Final
+    """
     try:
         import openpyxl
-        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
     except ImportError:
         logger.error("openpyxl não instalado. Execute: pip install openpyxl")
         return None
@@ -2475,32 +2602,71 @@ def exportar_resumo_fluxo_xlsx(caminho_xlsx: str, linhas_fluxo: list, logger: lo
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Resumo Fluxo"
-    ws.append(["Etapa", "Valor"])
+    
+    # Cabeçalho
+    ws.append(["Etapa", "Individual", "Controladas", "Consolidado"])
 
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    destaque_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    # Estilos
+    header_fill = PatternFill(start_color="006400", end_color="006400", fill_type="solid")  # Verde escuro
+    destaque_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")  # Verde claro para Saldo Inicial/Final
+    separador_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")  # Laranja para separação
+    vermelho_font = Font(color="FF0000")  # Vermelho para IRRF e Baixas
+    negrito_font = Font(bold=True)
+    negrito_branco_font = Font(bold=True, color="FFFFFF")
+    
+    # Formato numérico brasileiro: milhares com ponto, decimal com vírgula
+    fmt_numero_br = '#.##0,00;[Red]-#.##0,00'
 
+    # Aplicar estilo ao cabeçalho
     for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
+        cell.font = negrito_branco_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
 
-    for etapa, valor in linhas_fluxo:
-        ws.append([etapa, valor])
+    # Adicionar dados
+    for etapa, ind, ctrl, cons in linhas_fluxo:
+        ws.append([etapa, ind, ctrl, cons])
 
+    # Larguras de coluna
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 18
+
+    # Congelar primeira linha
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    ws.column_dimensions["A"].width = 24
-    ws.column_dimensions["B"].width = 20
 
+    # Aplicar formatação às linhas
     for r in range(2, ws.max_row + 1):
-        ws.cell(row=r, column=2).number_format = '#,##0.00_);[Red](#,##0.00)'
-        ws.cell(row=r, column=2).alignment = Alignment(horizontal="right")
         etapa = str(ws.cell(row=r, column=1).value)
+        
+        # Formato numérico para colunas B, C, D
+        for c in (2, 3, 4):
+            cell = ws.cell(row=r, column=c)
+            cell.number_format = fmt_numero_br
+            cell.alignment = Alignment(horizontal="right")
+        
+        # Destaque para Saldo Inicial e Saldo Final
         if etapa in {"Saldo Inicial", "Saldo Final"}:
-            for c in (1, 2):
-                ws.cell(row=r, column=c).font = Font(bold=True)
+            for c in range(1, 5):
+                ws.cell(row=r, column=c).font = negrito_font
                 ws.cell(row=r, column=c).fill = destaque_fill
+        
+        # IRRF e Baixas em vermelho
+        if etapa in {"IRRF", "Baixas"}:
+            for c in range(2, 5):
+                ws.cell(row=r, column=c).font = vermelho_font
+    
+    # Adicionar faixa laranja de separação antes do Saldo Final
+    # Encontrar a linha do Saldo Final e inserir separador acima
+    for r in range(2, ws.max_row + 1):
+        if str(ws.cell(row=r, column=1).value) == "Saldo Final":
+            # Inserir linha de separação
+            ws.insert_rows(r)
+            for c in range(1, 5):
+                ws.cell(row=r, column=c).fill = separador_fill
+                ws.cell(row=r, column=c).value = ""
+            break
 
     wb.save(caminho_xlsx)
     logger.info("Resumo Excel gerado: '%s'", caminho_xlsx)

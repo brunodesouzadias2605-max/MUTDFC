@@ -66,8 +66,8 @@ A coluna acrescentada à movimentação classificada chama-se **Destino**
 | 1 | Conta == `2104030007` | `IOF` |
 | 1 | Conta == `4401020004` | `Juros` |
 | 1 | Conta == `1103050050` | `IRRF` |
-| 2 | Conta começa com `120206` AND ≠ `1202060000` AND não está acima | `Parceiro` |
-| 3 | Cliente em `ajustes_manuais.json` | divisão do de-para manual |
+| 2 | Cliente em `ajustes_manuais.json` | divisão do de-para manual |
+| 3 | Conta começa com `120206` AND ≠ `1202060000` AND não está acima | `Parceiro` |
 | 4 | Cliente na ZFIT009 (via tabela de consolidação) | divisão da ZFIT009 |
 | 5 (menor) | Nenhuma regra casou | vazio → arquivo `SemDestino_*` gerado |
 
@@ -79,7 +79,7 @@ com as colunas estratégicas: `Nº doc. | Conta | CL | Cliente | Montante Razão
 O processamento **não é interrompido**; o TXT é gerado para investigação.
 
 O LOG registra a contagem de Destinos por regra:
-`por Conta específica | Parceiro | ajuste_manual | ZFIT009 | sem_destino`.
+`por Conta específica | Ajuste manual | Parceiro | ZFIT009 | sem_destino`.
 
 ---
 
@@ -91,16 +91,23 @@ Linhas com `N/A` são ignoradas nos totais do Resumo.
 
 ---
 
-## Consolida e Status Consolidação
+## Consolida e Estrutura de Consolidação
 
-| Situação | Consolida | Status Consolidação |
-|----------|-----------|---------------------|
-| Cliente com Consolida=S na ZCO059 | `S` | `S` |
-| Qualquer outro caso | `N` | `N` |
+| Situação | Consolida |
+|----------|-----------|
+| Destino com Consolida=S na ZCO059 | `S` |
+| Qualquer outro caso | `N` |
 
-> **Mudança de rótulo (v2):** os valores `Elimina` e `Não Consolida` foram
-> substituídos por `S` e `N` respectivamente. O Resumo de Fluxo continua
-> somando as linhas marcadas como `S` como "Eliminações" — apenas o rótulo mudou.
+> **Consolida por Destino (v3):** A coluna **Consolida** é determinada buscando
+> o **Destino** na coluna **Divisão** da tabela de consolidação, não mais pelo Cliente.
+> A coluna **Status Consolidação** foi removida; apenas **Consolida** permanece.
+
+### Estrutura de Consolidação
+
+Nova coluna que indica se a linha pertence a uma entidade **Individual** ou
+**Controladas**. Determinada via:
+1. Destino → ZCO059 (coluna Divisão)
+2. ZCO059 → coluna Descrição tratada: "Individual" → Individual; qualquer outro → Controladas
 
 ---
 
@@ -115,6 +122,7 @@ As seguintes colunas são **removidas** do CSV e Excel classificados finais
 | `Atribuição` |
 | `Imobilizado` |
 | `DiagRede` |
+| `Status Consolidação` |
 
 As colunas são necessárias internamente durante o processamento; são removidas
 apenas na escrita final pela função `separar_contrapartidas()`.
@@ -124,17 +132,17 @@ apenas na escrita final pela função `separar_contrapartidas()`.
 ## Consolidação intercompany (regra de cruzamento em 2 etapas)
 
 1. **ZFIT009**: busca a **Divisão** a partir do **Cliente**.
-2. **ZCO059**: busca o **Consolida** (`S`/vazio) a partir da **Divisão**.
+2. **ZCO059**: busca o **Consolida** (`S`/vazio) e **Descrição** (Individual/Controladas) a partir da **Divisão**.
 
 Saída:
 
 - `saidas/consolidado/Consolidacao_Cliente_Divisao_Consolida.csv`
-- Colunas: `Cliente | Divisão | Consolida`
+- Colunas: `Cliente | Divisão | Descrição | Consolida`
 
 Tratamentos:
 
 - Cliente repetido com múltiplas divisões: todas as combinações são mantidas, com log de ambiguidade.
-- Divisão vazia: mantida; `Consolida` fica vazio.
+- Divisão vazia: mantida; `Consolida` fica vazio, `Descrição` fica "Controladas".
 - Encoding robusto com correção de mojibake (`DivisÃ£o` → `Divisão`).
 
 ---
@@ -153,7 +161,7 @@ As tabelas são validadas por:
 - existência de arquivo;
 - cabeçalho esperado;
 - quantidade de linhas de dados > 0.
-- colunas obrigatórias da ZCO059 (`Empresa | Divisão | Consolida`) e rejeição do
+- colunas obrigatórias da ZCO059 (`Empresa | Divisão | Descrição | Consolida`) e rejeição do
   export incorreto com descrições como `SPE Controlada | S | SIM`.
 
 Destino padronizado (derivado automaticamente de `os.path.abspath(__file__)`):
@@ -215,20 +223,21 @@ o sistema lê o CSV com o parser de largura fixa (`|`) incluindo:
 
 ---
 
-## Status Consolidação na movimentação
+## Consolida na movimentação
 
 A opção 5 complementa `Classificado_<periodo>.csv` com:
 
 - `Destino` (regra de precedência descrita acima)
-- `Consolida`
-- `Status Consolidação`
+- `Consolida` (buscado via **Destino** na tabela de consolidação)
+- `Estrutura de Consolidação` (Individual/Controladas via ZCO059)
 
-Lógica:
+Lógica do Consolida:
 
-- Cliente encontrado e `Consolida == "S"` → **S** (consolida/elimina)
+- **Destino** encontrado com `Consolida == "S"` na ZCO059 → **S** (consolida/elimina)
 - Qualquer outro caso → **N** (não consolida)
 
-> Antes da versão 2 os valores eram "Elimina" e "Não Consolida".
+> **Mudança (v3):** o Consolida é determinado pelo **Destino** (não mais pelo Cliente).
+> A coluna "Status Consolidação" foi removida; apenas "Consolida" permanece.
 
 ---
 
@@ -264,24 +273,37 @@ Opção 8 gera:
 - `Resumo_<periodo>.csv`
 - `Resumo_<periodo>.xlsx`
 
-Estrutura fixa:
+### Estrutura segregada
 
-1. Saldo Inicial  
-2. Adições  
-3. (-) Eliminações  
-4. Juros  
-5. IOF  
-6. IRRF  
-7. Baixas  
-8. Saldo Final
+O resumo é segregado em três colunas:
 
-Fórmula implementada (calibrável):
+| Etapa | Individual | Controladas | Consolidado |
+|-------|------------|-------------|-------------|
+| Saldo Inicial | ... | ... | Individual + Controladas |
+| Adições | ... | ... | Individual + Controladas |
+| (-) Eliminações | ... | ... | Individual + Controladas |
+| Juros | ... | ... | Individual + Controladas |
+| IOF | ... | ... | Individual + Controladas |
+| IRRF | ... | ... | Individual + Controladas |
+| Baixas | ... | ... | Individual + Controladas |
+| Saldo Final | ... | ... | Individual + Controladas |
+
+- **Eliminações** = soma das linhas com `Consolida="S"` (todas as classificações), apresentadas com **sinal invertido**.
+- **Estrutura de Consolidação**: determinada via Destino → ZCO059 (Divisão) → Descrição (Individual/Controladas).
+
+### Fórmula implementada (calibrável)
 
 ```
 Saldo Final = Saldo Inicial + Adições − Eliminações + Juros + IOF − IRRF − Baixas
 ```
 
-Observação: **Eliminações** é subtraído como subconjunto para evitar duplicidade.
+### Formatação corporativa do Resumo .xlsx
+
+- Cabeçalho verde com texto branco em negrito
+- Saldo Inicial e Saldo Final em negrito com destaque verde claro
+- IRRF e Baixas em vermelho
+- Formato monetário BR
+- Faixa laranja de separação antes do Saldo Final
 
 ---
 
