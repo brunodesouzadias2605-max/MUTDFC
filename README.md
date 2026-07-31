@@ -151,23 +151,22 @@ Tratamentos:
 
 Opção 3 permite:
 
-- **Via SAP GUI Scripting** — fluxo portado diretamente dos VBS gravados na
-  sessão atual (IDs de controle alinhados aos gravados; não usar com VBS antigos).
+- **Via SAP GUI Scripting** — fluxo simplificado que exporta TODAS as colunas diretamente.
 - **Via arquivo manual** já exportado (padrão sugerido quando a automação SAP
-  não estiver disponível ou o usuário preferir exportar manualmente).
+  não estiver disponível ou o usuário preferir exportar manualmente via ZCO059Total.vbs).
 
 As tabelas são validadas por:
 
 - existência de arquivo;
-- cabeçalho esperado;
-- quantidade de linhas de dados > 0.
-- colunas obrigatórias da ZCO059 (`Empresa | Divisão | Descrição | Consolida`) e rejeição do
-  export incorreto com descrições como `SPE Controlada | S | SIM`.
+- cabeçalho esperado (detecção automática do formato);
+- quantidade de linhas de dados > 0;
+- colunas selecionadas por POSIÇÃO na ZCO059 (Divisão=4ª col, Descrição-estrutura=antes de Consolida);
+- log de validação: nº de linhas, contagem Individual/Controladas.
 
 Destino padronizado (derivado automaticamente de `os.path.abspath(__file__)`):
 
 - `saidas/tabelas/ZFIT009.csv`
-- `saidas/tabelas/ZCO059.csv`
+- `saidas/tabelas/ZCO059.csv` (formato: `Divisão|Descrição|Consolida`)
 
 ### Fluxo SAP — ZFIT009 (alinhado ao VBS gravado)
 
@@ -184,23 +183,21 @@ Destino padronizado (derivado automaticamente de `os.path.abspath(__file__)`):
 11. `btn[11]` (Salvar/Substituir).
 12. 3× `sendVKey 3` para fechar telas e retornar ao menu.
 
-### Fluxo SAP — ZCO059 (alinhado ao VBS gravado)
+### Fluxo SAP — ZCO059 (simplificado — ZCO059Total.vbs)
 
 1. Navegar para `zco059` via campo de comando.
 2. Aguardar ALV grid em `subSUB_DRE:ZCOR043:0100/cntlCCONTAINER_1/shellcont/shell`.
-3. `pressToolbarButton "&COL0"` para abrir seleção de colunas.
-4. A seleção de colunas do ALV é **obrigatória** e replica o VBS com esperas entre
-   cada passo do popup (`btnAPP_FL_SING` + `currentCellRow = 1`, `2`, sete presses
-   adicionais, `currentCellRow = 3` e `btn[0]` para confirmar).
-5. Se a seleção falhar após 3 tentativas, a importação é abortada com erro claro
-   orientando a exportar via `ZCO059.vbs` e usar a opção de importar por arquivo.
-6. `setCurrentCell(-1, "CONSOLIDA")` + `selectColumn("CONSOLIDA")`.
-7. `pressToolbarContextButton "&MB_FILTER"` + `selectContextMenuItem "&FILTER"`.
-8. Preencher `%%DYN001-LOW = "S"` e confirmar com `btn[0]`.
-9. `pressToolbarContextButton "&MB_EXPORT"` + `selectContextMenuItem "&PC"`.
-10. `btn[0]` para confirmar tipo de exportação.
-11. Preencher `DY_PATH = <pasta do projeto>/saidas/tabelas`; o arquivo é validado
-    antes de ser renomeado para `ZCO059.csv`.
+3. `pressToolbarContextButton "&MB_EXPORT"` + `selectContextMenuItem "&PC"`.
+4. `btn[0]` para confirmar tipo de exportação.
+5. Preencher `DY_PATH` e `DY_FILENAME = ZCO059GERAL.csv`; btn[11] para salvar.
+6. **Processamento em Python**: o arquivo completo é parseado e as colunas são
+   selecionadas por POSIÇÃO (há DUAS colunas "Descrição"; a correta é a que fica
+   imediatamente antes de "Consolida").
+7. Filtragem `Consolida = "S"` feita em Python.
+8. Mapeamento de Descrição-estrutura: "Individual" → Individual; outro → Controladas.
+
+> **Nota**: A seleção de colunas via `&COL0` foi removida para eliminar erros.
+> O Python faz toda a filtragem e seleção de colunas por posição.
 
 ### Robustez contra o erro 619
 
@@ -216,10 +213,13 @@ o sistema lê o CSV com o parser de largura fixa (`|`) incluindo:
 
 - correção de mojibake (`Divis\xef\xbf\xbd\xef\xbf\xbdo` → `Divisão`);
 - ignora linhas de título, separadores e rodapé SAP;
-- aceita tanto o formato largura-fixa do VBS quanto o CSV simples normalizado;
+- aceita três formatos:
+  - **ZCO059GERAL** (arquivo completo com TODAS as colunas) — colunas selecionadas por POSIÇÃO;
+  - **Normalizado** (`Divisão|Descrição|Consolida`) — formato de saída do script;
+  - **Legado** (`Empresa|Divisão|Descrição|Consolida`) — retrocompatível;
 - valida `Divisão` (alfanumérica curta) e `Consolida` (`S`, `N` ou vazio);
-- rejeita explicitamente o arquivo incorreto sem seleção de colunas do ALV,
-  exibindo erro claro para refazer a exportação.
+- filtra apenas linhas com `Consolida = "S"`;
+- log detalhado: nº de linhas processadas, registros carregados, contagem Individual/Controladas.
 
 ---
 
