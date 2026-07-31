@@ -106,8 +106,12 @@ Linhas com `N/A` são ignoradas nos totais do Resumo.
 
 Nova coluna que indica se a linha pertence a uma entidade **Individual** ou
 **Controladas**. Determinada via:
-1. Destino → ZCO059 (coluna Divisão)
+1. **Div** (coluna do lançamento) → ZCO059 (coluna Divisão)
 2. ZCO059 → coluna Descrição tratada: "Individual" → Individual; qualquer outro → Controladas
+3. Se a divisão da linha (Div) não existir na ZCO059, deixa em branco.
+
+> **Importante**: A coluna "Consolida" continua sendo resolvida por **Destino**; apenas
+> a "Estrutura de Consolidação" usa a coluna **Div** (divisão real do lançamento).
 
 ---
 
@@ -289,7 +293,7 @@ O resumo é segregado em três colunas:
 | Saldo Final | ... | ... | Individual + Controladas |
 
 - **Eliminações** = soma das linhas com `Consolida="S"` (todas as classificações), apresentadas com **sinal invertido**.
-- **Estrutura de Consolidação**: determinada via Destino → ZCO059 (Divisão) → Descrição (Individual/Controladas).
+- **Estrutura de Consolidação**: determinada via **Div** (divisão real do lançamento) → ZCO059 (Divisão) → Descrição (Individual/Controladas).
 
 ### Fórmula implementada (calibrável)
 

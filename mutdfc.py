@@ -1835,7 +1835,10 @@ def aplicar_status_consolidacao(
         (a) Conta específica  (b) Ajuste manual  (c) 120206*→Parceiro  (d) ZFIT009
     - Consolida usa "S"/"N" — buscado via Destino na Divisão da tabela de consolidação.
     - Removida coluna "Status Consolidação" (mantém só "Consolida").
-    - Nova coluna "Estrutura de Consolidação" (Individual/Controladas) via ZCO059.
+    - Nova coluna "Estrutura de Consolidação" (Individual/Controladas) via coluna Div:
+        * Busca Div (divisão real do lançamento) na ZCO059 (coluna Divisão).
+        * Retorna "Individual" se Descrição == "Individual", senão "Controladas".
+        * Se Div não existir na ZCO059, deixa em branco.
     - Gera TXT 'SemDestino_*' com linhas sem Destino.
     """
     if not os.path.isfile(arquivo_classificado):
@@ -1895,7 +1898,13 @@ def aplicar_status_consolidacao(
     # Detecta índice da coluna Conta a partir do cabeçalho (robusto após remoção)
     idx_conta_dyn = IDX_CONTA
     idx_cliente_dyn = IDX_CLIENTE
+    idx_div_dyn = IDX_DIV
     cabecalho_saida = None
+
+    # Contadores de Estrutura de Consolidação
+    estrutura_individual = 0
+    estrutura_controladas = 0
+    estrutura_sem_div = 0
 
     for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
         tp = tipo_de_linha(linha)
@@ -1908,6 +1917,8 @@ def aplicar_status_consolidacao(
                     idx_conta_dyn = i
                 if cn == "cliente":
                     idx_cliente_dyn = i
+                if cn == "div":
+                    idx_div_dyn = i
             # Novo cabeçalho: Destino|Consolida|Estrutura de Consolidação (sem Status Consolidação)
             cabecalho_saida = linha.rstrip("|") + "|Destino|Consolida|Estrutura de Consolidação|"
             continue
@@ -1917,6 +1928,7 @@ def aplicar_status_consolidacao(
         campos = parse_linha(linha)
         conta = campos[idx_conta_dyn].strip() if len(campos) > idx_conta_dyn else ""
         cliente = campos[idx_cliente_dyn].strip() if len(campos) > idx_cliente_dyn else ""
+        div = campos[idx_div_dyn].strip() if len(campos) > idx_div_dyn else ""
 
         # Resolve Destino com precedência: Conta específica → Ajuste manual → Parceiro → ZFIT009
         destino, regra = resolver_destino(conta, cliente, ajustes_manuais, idx_consolida)
@@ -1925,9 +1937,29 @@ def aplicar_status_consolidacao(
         # Consolida por Destino: buscar Destino na coluna Divisão da consolidação
         # Se houver múltiplos destinos (separados por ;), usar o primeiro
         destino_principal = destino.split(";")[0].strip() if destino else ""
-        info = divisao_info.get(destino_principal, ("Controladas", ""))
-        estrutura = info[0] if info[0] else "Controladas"
-        consolida_divisao = info[1]
+        info_destino = divisao_info.get(destino_principal, ("", ""))
+        consolida_divisao = info_destino[1]
+
+        # Estrutura de Consolidação por Div (divisão real do lançamento):
+        # buscar Div na coluna Divisão da ZCO059; retornar Individual ou Controladas
+        if div:
+            info_div = divisao_info.get(div, None)
+            if info_div is not None:
+                descricao_div = info_div[0]
+                if descricao_div == "Individual":
+                    estrutura = "Individual"
+                    estrutura_individual += 1
+                else:
+                    estrutura = "Controladas"
+                    estrutura_controladas += 1
+            else:
+                # Div não encontrada na ZCO059
+                estrutura = ""
+                estrutura_sem_div += 1
+        else:
+            # Div em branco na linha
+            estrutura = ""
+            estrutura_sem_div += 1
 
         if consolida_divisao == "S":
             consolida = "S"
@@ -1972,6 +2004,10 @@ def aplicar_status_consolidacao(
     logger.info(
         "Consolida (por Destino): S=%d | N=%d",
         consolida_s, consolida_n,
+    )
+    logger.info(
+        "Estrutura de Consolidação (por Div): Individual=%d | Controladas=%d | Sem Div na ZCO059=%d",
+        estrutura_individual, estrutura_controladas, estrutura_sem_div,
     )
 
     # Gera TXT com linhas sem Destino
