@@ -2,6 +2,7 @@
 saidas/
 logs/
 saldo_inicial.json
+ajustes_manuais.json
 
 # Arquivos CSV e LOG gerados em qualquer pasta
 *.csv
