@@ -5,11 +5,12 @@ Automação em Python para:
 1. Extrair razão contábil (FBL3N) via SAP GUI Scripting.
 2. Consolidar e classificar movimentações.
 3. Importar tabelas intercompany (`ZFIT009` e `ZCO059`).
-4. Cruzar **Cliente → Divisão → Consolida**.
-5. Aplicar **Status Consolidação** (`Elimina` / `Não Consolida`).
+4. Cruzar **Cliente → Destino** via regras por Conta e ajustes manuais.
+5. Aplicar **Status Consolidação** (`S` / `N`).
 6. Separar contrapartidas para auditoria.
 7. Gerar classificado e resumo em CSV + Excel.
 8. Persistir **Saldo Inicial** com histórico.
+9. Gerenciar **Ajustes Manuais** (de-para Cliente → Divisão).
 
 ---
 
@@ -25,8 +26,98 @@ Automação em Python para:
 7 - Informar/atualizar Saldo Inicial
 8 - Resumo (Saldo Inicial → Saldo Final)
 9 - Executar tudo em sequência
+A - Ajustes Manuais (de-para Cliente → Divisão)
 0 - Sair
 ```
+
+---
+
+## Ajustes Manuais (de-para Cliente → Divisão)
+
+A opção **A** permite gerenciar um de-para manual **Cliente → Divisão** que tem
+**prioridade** sobre a ZFIT009 na resolução do campo Destino.
+
+- Persistido em `ajustes_manuais.json` na pasta do projeto.
+- Estrutura: `{ "vinculos": { "2200000404": "E024", ... }, "ultima_alteracao": ..., "usuario": ... }`.
+- Se o arquivo não existir, é criado automaticamente com os 5 vínculos iniciais:
+
+| Cliente    | Divisão |
+|------------|---------|
+| 2200000404 | E024    |
+| 2200010827 | E662    |
+| 2200000193 | MAGI    |
+| 1800000063 | P001    |
+| 1800000060 | B001    |
+
+Submenu: **A** Adicionar · **E** Editar · **R** Remover · **V** Voltar.
+
+---
+
+## Coluna "Destino" — Precedência de regras
+
+A coluna acrescentada à movimentação classificada chama-se **Destino**
+(renomeada a partir de "Divisão"). Ela é preenchida na seguinte ordem:
+
+| Prioridade | Regra | Resultado |
+|-----------|-------|-----------|
+| 1 (maior) | Conta == `1202060002` | `MRL` |
+| 1 | Conta == `1202060016` | `Prime` |
+| 1 | Conta == `1202060104` | `AHS` |
+| 1 | Conta == `2104030007` | `IOF` |
+| 1 | Conta == `4401020004` | `Juros` |
+| 1 | Conta == `1103050050` | `IRRF` |
+| 2 | Conta começa com `120206` AND ≠ `1202060000` AND não está acima | `Parceiro` |
+| 3 | Cliente em `ajustes_manuais.json` | divisão do de-para manual |
+| 4 | Cliente na ZFIT009 (via tabela de consolidação) | divisão da ZFIT009 |
+| 5 (menor) | Nenhuma regra casou | vazio → arquivo `SemDestino_*` gerado |
+
+### Arquivo SemDestino
+
+Linhas que não obtiverem Destino após todas as regras geram o arquivo
+`SemDestino_<datainicial>_a_<datafinal>.txt` (UTF-8-SIG) em `saidas/consolidado/`
+com as colunas estratégicas: `Nº doc. | Conta | CL | Cliente | Montante Razão | Texto`.
+O processamento **não é interrompido**; o TXT é gerado para investigação.
+
+O LOG registra a contagem de Destinos por regra:
+`por Conta específica | Parceiro | ajuste_manual | ZFIT009 | sem_destino`.
+
+---
+
+## Classificação "N/A"
+
+Onde a coluna `Classificação` ficar vazia (linhas que não casaram em nenhuma
+regra de classificação), ela é preenchida com **`N/A`** — nunca fica em branco.
+Linhas com `N/A` são ignoradas nos totais do Resumo.
+
+---
+
+## Consolida e Status Consolidação
+
+| Situação | Consolida | Status Consolidação |
+|----------|-----------|---------------------|
+| Cliente com Consolida=S na ZCO059 | `S` | `S` |
+| Qualquer outro caso | `N` | `N` |
+
+> **Mudança de rótulo (v2):** os valores `Elimina` e `Não Consolida` foram
+> substituídos por `S` e `N` respectivamente. O Resumo de Fluxo continua
+> somando as linhas marcadas como `S` como "Eliminações" — apenas o rótulo mudou.
+
+---
+
+## Colunas removidas da saída final
+
+As seguintes colunas são **removidas** do CSV e Excel classificados finais
+(gerados na opção 6), preservando as demais:
+
+| Coluna removida |
+|-----------------|
+| `St` |
+| `Atribuição` |
+| `Imobilizado` |
+| `DiagRede` |
+
+As colunas são necessárias internamente durante o processamento; são removidas
+apenas na escrita final pela função `separar_contrapartidas()`.
 
 ---
 
@@ -128,15 +219,16 @@ o sistema lê o CSV com o parser de largura fixa (`|`) incluindo:
 
 A opção 5 complementa `Classificado_<periodo>.csv` com:
 
-- `Divisão`
+- `Destino` (regra de precedência descrita acima)
 - `Consolida`
 - `Status Consolidação`
 
 Lógica:
 
-- Cliente encontrado e `Consolida == "S"` → **Elimina**
-- Cliente não encontrado → **Não Consolida**
-- `Consolida` diferente de `"S"` (vazio/N/outros) → **Não Consolida**
+- Cliente encontrado e `Consolida == "S"` → **S** (consolida/elimina)
+- Qualquer outro caso → **N** (não consolida)
+
+> Antes da versão 2 os valores eram "Elimina" e "Não Consolida".
 
 ---
 

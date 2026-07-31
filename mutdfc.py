@@ -45,6 +45,7 @@ PASTA_CONSOLIDADO = os.path.join(PASTA_BASE, "saidas", "consolidado")
 PASTA_TABELAS     = os.path.join(PASTA_BASE, "saidas", "tabelas")
 PASTA_LOGS        = os.path.join(PASTA_BASE, "logs")
 ARQUIVO_SALDO_INICIAL = os.path.join(PASTA_BASE, "saldo_inicial.json")
+ARQUIVO_AJUSTES_MANUAIS = os.path.join(PASTA_BASE, "ajustes_manuais.json")
 
 # Variante de layout salva no SAP (campo txtV-LOW da tela de seleção de layout)
 CONTA_LAYOUT = "MUTDFC"
@@ -113,8 +114,36 @@ CONTAS_CLASSIFICACAO = {
     CONTA_JUROS: "Juros",
 }
 
-# Prefixo das contas de Mútuo
+# Prefixo das contas de Mútuo (4 dígitos — filtra linhas de Mútuo)
 PREFIXO_MUTUO = "1202"
+
+# Prefixo longo das contas de Mútuo (6 dígitos — usado na regra "Parceiro")
+PREFIXO_MUTUO_LONGO = "120206"
+
+# Conta base de Mútuo (excluída da regra "Parceiro")
+CONTA_MUTUO_BASE = "1202060000"
+
+# De-para Conta → Destino (prioridade máxima na resolução do Destino)
+CONTAS_DESTINO_POR_CONTA = {
+    "1202060002": "MRL",
+    "1202060016": "Prime",
+    "1202060104": "AHS",
+    "2104030007": "IOF",
+    "4401020004": "Juros",
+    "1103050050": "IRRF",
+}
+
+# Vínculos iniciais para ajustes_manuais.json (criados se o arquivo não existir)
+AJUSTES_INICIAIS = {
+    "2200000404": "E024",
+    "2200010827": "E662",
+    "2200000193": "MAGI",
+    "1800000063": "P001",
+    "1800000060": "B001",
+}
+
+# Colunas removidas da saída final (Classificado CSV + Excel)
+COLUNAS_REMOVER_SAIDA = {"St", "Atribuição", "Imobilizado", "DiagRede"}
 
 # Contas de contrapartida movidas para auditoria após classificação
 CONTAS_CONTRAPARTIDA_AUDITORIA = {CONTA_JUROS, CONTA_IRRF, CONTA_IOF}
@@ -980,8 +1009,9 @@ def classificar(
                 logger.debug(
                     "Mútuo sem classificação: Nº doc.=%s Conta=%s CL='%s'", nr, conta, cl
                 )
+                classif = "N/A"  # preencher vazio com N/A (item 3)
         else:
-            classif = ""
+            classif = "N/A"  # linhas não-Mútuo também recebem N/A (item 3)
             nao_mutuo_ignoradas += 1
 
         linhas_classificadas.append(linha.rstrip("|") + "|" + classif + "|")
@@ -1753,7 +1783,16 @@ def aplicar_status_consolidacao(
     logger: logging.Logger,
 ):
     """
-    Adiciona colunas Divisão, Consolida e Status Consolidação ao classificado.
+    Adiciona colunas Destino, Consolida e Status Consolidação ao classificado.
+
+    Alterações em relação à versão anterior:
+    - Coluna renomeada de "Divisão" para "Destino" (item 2).
+    - Destino determinado por resolver_destino() com precedência:
+        (a) Conta específica  (b) 120206*→Parceiro
+        (c) ajuste_manual.json  (d) ZFIT009
+    - Consolida usa "S"/"N" — nunca vazio (item 4).
+    - Status Consolidação usa "S"/"N" (era "Elimina"/"Não Consolida") (item 4).
+    - Gera TXT 'SemDestino_*' com linhas sem Destino (item 2).
     """
     if not os.path.isfile(arquivo_classificado):
         logger.error("Arquivo classificado não encontrado: '%s'", arquivo_classificado)
@@ -1762,6 +1801,7 @@ def aplicar_status_consolidacao(
         logger.error("Arquivo de consolidação não encontrado: '%s'", arquivo_consolidacao)
         return None
 
+    # Carrega de-para cliente→(divisao, consolida) da tabela de consolidação
     idx_consolida = {}
     for linha in ler_csv_corrigindo_encoding(arquivo_consolidacao, logger):
         texto = linha.strip()
@@ -1778,56 +1818,119 @@ def aplicar_status_consolidacao(
         cliente, divisao, consolida = partes[0], partes[1], partes[2].upper()
         idx_consolida.setdefault(cliente, []).append((divisao, consolida))
 
-    linhas_saida = []
-    clientes_sem_match = set()
-    elimina = 0
-    nao_consolida = 0
+    # Carrega ajustes manuais (prioridade sobre ZFIT009)
+    ajustes_manuais = carregar_ajustes_manuais(logger)
 
+    linhas_saida = []
+    linhas_sem_destino = []   # linhas que não obtiveram Destino
+
+    # Contadores por regra de Destino (item 2 — LOG detalhado)
+    contadores_destino = {
+        "conta_especifica": 0,
+        "parceiro": 0,
+        "ajuste_manual": 0,
+        "zfit009": 0,
+        "sem_destino": 0,
+    }
+    consolida_s = 0
+    consolida_n = 0
+
+    # Detecta índice da coluna Conta a partir do cabeçalho (robusto após remoção)
+    idx_conta_dyn = IDX_CONTA
+    idx_cliente_dyn = IDX_CLIENTE
     cabecalho_saida = None
+
     for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
         tp = tipo_de_linha(linha)
         if tp == "cabecalho":
-            cabecalho_saida = linha.rstrip("|") + "|Divisão|Consolida|Status Consolidação|"
+            # Detectar índices dinamicamente pelo cabeçalho
+            campos_cab = parse_linha(linha)
+            for i, c in enumerate(campos_cab):
+                cn = c.strip().lower()
+                if cn == "conta":
+                    idx_conta_dyn = i
+                if cn == "cliente":
+                    idx_cliente_dyn = i
+            cabecalho_saida = linha.rstrip("|") + "|Destino|Consolida|Status Consolidação|"
             continue
         if tp != "dado":
             continue
 
         campos = parse_linha(linha)
-        cliente = campos[IDX_CLIENTE].strip() if len(campos) > IDX_CLIENTE else ""
+        conta = campos[idx_conta_dyn].strip() if len(campos) > idx_conta_dyn else ""
+        cliente = campos[idx_cliente_dyn].strip() if len(campos) > idx_cliente_dyn else ""
+
+        # Resolve Destino com precedência explícita (item 2)
+        destino, regra = resolver_destino(conta, cliente, ajustes_manuais, idx_consolida)
+        contadores_destino[regra] = contadores_destino.get(regra, 0) + 1
+
+        # Determine Consolida ("S"/"N") pela tabela de consolidação (item 4)
         correspondencias = idx_consolida.get(cliente, [])
-
-        if not correspondencias:
-            divisao = ""
-            consolida = ""
-            status = "Não Consolida"
-            if cliente:
-                clientes_sem_match.add(cliente)
-            nao_consolida += 1
+        if correspondencias and any(c == "S" for _, c in correspondencias):
+            consolida = "S"
+            status = "S"
+            consolida_s += 1
         else:
-            divs = sorted({d for d, _ in correspondencias if d})
-            divisao = ";".join(divs)
-            consolida = "S" if any(c == "S" for _, c in correspondencias) else ""
-            if consolida == "S":
-                status = "Elimina"
-                elimina += 1
-            else:
-                status = "Não Consolida"
-                nao_consolida += 1
+            consolida = "N"
+            status = "N"
+            consolida_n += 1
 
-        linhas_saida.append(linha.rstrip("|") + f"|{divisao}|{consolida}|{status}|")
+        linhas_saida.append(linha.rstrip("|") + f"|{destino}|{consolida}|{status}|")
+
+        # Coleta linha sem Destino para TXT (item 2)
+        if not destino:
+            nr = campos[IDX_NRDOC].strip() if len(campos) > IDX_NRDOC else ""
+            cl = campos[IDX_CL].strip() if len(campos) > IDX_CL else ""
+            montante = campos[IDX_MONTANTE].strip() if len(campos) > IDX_MONTANTE else ""
+            texto_doc = campos[IDX_TEXTO].strip() if len(campos) > IDX_TEXTO else ""
+            linhas_sem_destino.append(
+                f"{nr}|{conta}|{cl}|{cliente}|{montante}|{texto_doc}"
+            )
 
     os.makedirs(pasta_saida, exist_ok=True)
     caminho_saida = os.path.join(pasta_saida, os.path.basename(arquivo_classificado))
+    cab_fallback = (
+        CABECALHO_CONSOLIDADO.rstrip("|")
+        + "|Classificação|Destino|Consolida|Status Consolidação|"
+    )
     with open(caminho_saida, "w", encoding="utf-8-sig", newline="") as f:
-        f.write((cabecalho_saida or (CABECALHO_CONSOLIDADO.rstrip("|") + "|Classificação|Divisão|Consolida|Status Consolidação|")) + "\n")
+        f.write((cabecalho_saida or cab_fallback) + "\n")
         for linha in linhas_saida:
             f.write(linha + "\n")
 
     logger.info("Status consolidação aplicado em '%s'.", caminho_saida)
-    logger.info("Status Consolidação: Elimina=%d | Não Consolida=%d", elimina, nao_consolida)
-    logger.info("Clientes sem correspondência na consolidação: %d", len(clientes_sem_match))
-    for cliente in sorted(list(clientes_sem_match))[:30]:
-        logger.warning("  Cliente sem match: %s", cliente)
+    logger.info(
+        "Destino — por Conta específica: %d | Parceiro: %d | "
+        "Ajuste manual: %d | ZFIT009: %d | Sem Destino: %d",
+        contadores_destino["conta_especifica"],
+        contadores_destino["parceiro"],
+        contadores_destino["ajuste_manual"],
+        contadores_destino["zfit009"],
+        contadores_destino["sem_destino"],
+    )
+    logger.info(
+        "Consolida: S=%d | N=%d | Status Consolidação: S=%d | N=%d",
+        consolida_s, consolida_n, consolida_s, consolida_n,
+    )
+
+    # Gera TXT com linhas sem Destino (item 2)
+    qtd_sem = contadores_destino["sem_destino"]
+    if qtd_sem:
+        logger.warning(
+            "Linhas sem Destino: %d — gerando arquivo TXT para investigação.", qtd_sem
+        )
+        data_ini_str, data_fim_str = _extrair_datas_do_nome(
+            os.path.basename(arquivo_classificado)
+        )
+        nome_txt = f"SemDestino_{data_ini_str}_a_{data_fim_str}.txt"
+        caminho_txt = os.path.join(pasta_saida, nome_txt)
+        with open(caminho_txt, "w", encoding="utf-8-sig", newline="") as f:
+            f.write("Nº doc.|Conta|CL|Cliente|Montante Razão|Texto\n")
+            for linha_txt in linhas_sem_destino:
+                f.write(linha_txt + "\n")
+        logger.warning("  Arquivo SemDestino gerado: '%s' (%d linha(s)).", caminho_txt, qtd_sem)
+    else:
+        logger.info("Nenhuma linha sem Destino.")
 
     return caminho_saida
 
@@ -1839,18 +1942,26 @@ def separar_contrapartidas(
 ):
     """
     Move linhas de contas de contrapartida para auditoria e remove do principal.
+    Ao escrever a saída final, remove as colunas em COLUNAS_REMOVER_SAIDA
+    (St, Atribuição, Imobilizado, DiagRede) — item 5.
     """
     if not os.path.isfile(arquivo_classificado):
         logger.error("Arquivo classificado não encontrado: '%s'", arquivo_classificado)
         return None, None
 
     cabecalho = None
+    indices_remover = set()   # índices (0-based no split) a remover na saída
     linhas_principais = []
     linhas_auditoria = []
     for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
         tp = tipo_de_linha(linha)
         if tp == "cabecalho":
             cabecalho = linha
+            # Calcular índices das colunas a remover (baseado no cabeçalho)
+            partes_cab = linha.split("|")
+            for i, p in enumerate(partes_cab):
+                if p.strip() in COLUNAS_REMOVER_SAIDA:
+                    indices_remover.add(i)
             continue
         if tp != "dado":
             continue
@@ -1861,6 +1972,19 @@ def separar_contrapartidas(
         else:
             linhas_principais.append(linha)
 
+    def _aplicar_remocao(linha_raw):
+        """Remove colunas pelos índices calculados do cabeçalho."""
+        if not indices_remover:
+            return linha_raw
+        partes = linha_raw.split("|")
+        partes_filtradas = [p for i, p in enumerate(partes) if i not in indices_remover]
+        return "|".join(partes_filtradas)
+
+    # Cabeçalho de saída sem as colunas removidas
+    cab_saida = _aplicar_remocao(
+        cabecalho if cabecalho else (CABECALHO_CONSOLIDADO.rstrip("|") + "|Classificação|")
+    )
+
     base = os.path.basename(arquivo_classificado)
     data_ini_str, data_fim_str = _extrair_datas_do_nome(base)
     periodo = f"{data_ini_str}_a_{data_fim_str}"
@@ -1870,15 +1994,22 @@ def separar_contrapartidas(
     caminho_auditoria = os.path.join(pasta_saida, f"Auditoria_Contrapartidas_{periodo}.csv")
 
     with open(caminho_principal, "w", encoding="utf-8-sig", newline="") as f:
-        f.write((cabecalho or (CABECALHO_CONSOLIDADO.rstrip("|") + "|Classificação|")) + "\n")
+        f.write(cab_saida + "\n")
         for linha in linhas_principais:
-            f.write(linha + "\n")
+            f.write(_aplicar_remocao(linha) + "\n")
 
     with open(caminho_auditoria, "w", encoding="utf-8-sig", newline="") as f:
-        f.write((cabecalho or (CABECALHO_CONSOLIDADO.rstrip("|") + "|Classificação|")) + "\n")
+        f.write(cab_saida + "\n")
         for linha in linhas_auditoria:
-            f.write(linha + "\n")
+            f.write(_aplicar_remocao(linha) + "\n")
 
+    cols_removidas = sorted(
+        p.strip()
+        for i, p in enumerate(
+            (cabecalho or "").split("|")
+        )
+        if i in indices_remover and p.strip()
+    )
     logger.info(
         "Contrapartidas separadas: %d linha(s) para auditoria em '%s'.",
         len(linhas_auditoria),
@@ -1889,6 +2020,14 @@ def separar_contrapartidas(
         len(linhas_principais),
         caminho_principal,
     )
+    if cols_removidas:
+        logger.info(
+            "Colunas removidas da saída final: %s", ", ".join(cols_removidas)
+        )
+    else:
+        logger.info(
+            "Nenhuma coluna de COLUNAS_REMOVER_SAIDA encontrada no cabeçalho."
+        )
     return caminho_principal, caminho_auditoria
 
 
@@ -2021,6 +2160,182 @@ def salvar_saldo_inicial(valor: float, periodo: str, logger: logging.Logger):
     return registro
 
 
+# ---------------------------------------------------------------------------
+# AJUSTES MANUAIS (de-para Cliente → Divisão)
+# ---------------------------------------------------------------------------
+
+def carregar_ajustes_manuais(logger: logging.Logger) -> dict:
+    """
+    Carrega ajustes manuais de 'ajustes_manuais.json'.
+    Se o arquivo não existir, cria com os 5 vínculos iniciais (AJUSTES_INICIAIS).
+    Retorna um dict no formato:
+      { "vinculos": {cliente: divisao, ...}, "ultima_alteracao": ..., "usuario": ... }
+    """
+    if not os.path.isfile(ARQUIVO_AJUSTES_MANUAIS):
+        dados = {
+            "vinculos": dict(AJUSTES_INICIAIS),
+            "ultima_alteracao": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "usuario": getuser(),
+        }
+        try:
+            with open(ARQUIVO_AJUSTES_MANUAIS, "w", encoding="utf-8") as f:
+                json.dump(dados, f, ensure_ascii=False, indent=2)
+            logger.info(
+                "Ajustes manuais criados com vínculos iniciais: '%s'.",
+                ARQUIVO_AJUSTES_MANUAIS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Falha ao criar ajustes_manuais.json: %s", exc)
+        return dados
+
+    try:
+        with open(ARQUIVO_AJUSTES_MANUAIS, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+        if "vinculos" not in dados or not isinstance(dados["vinculos"], dict):
+            dados["vinculos"] = {}
+        logger.debug(
+            "Ajustes manuais carregados: %d vínculo(s).", len(dados["vinculos"])
+        )
+        return dados
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Falha ao ler ajustes_manuais.json: %s", exc)
+        return {"vinculos": {}}
+
+
+def salvar_ajustes_manuais(ajustes: dict, logger: logging.Logger) -> None:
+    """Persiste ajustes manuais em 'ajustes_manuais.json' com usuário/timestamp."""
+    ajustes["ultima_alteracao"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ajustes["usuario"] = getuser()
+    try:
+        with open(ARQUIVO_AJUSTES_MANUAIS, "w", encoding="utf-8") as f:
+            json.dump(ajustes, f, ensure_ascii=False, indent=2)
+        logger.info(
+            "Ajustes manuais salvos: %d vínculo(s) em '%s'.",
+            len(ajustes.get("vinculos", {})),
+            ARQUIVO_AJUSTES_MANUAIS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Falha ao salvar ajustes_manuais.json: %s", exc)
+
+
+def menu_ajustes_manuais(logger: logging.Logger, caminho_log: str) -> None:
+    """Menu interativo para gerenciar o de-para manual Cliente → Divisão."""
+    print("=" * 60)
+    print("  Ajustes Manuais — De-para Cliente → Divisão")
+    print("=" * 60)
+
+    ajustes = carregar_ajustes_manuais(logger)
+    vinculos = ajustes.setdefault("vinculos", {})
+
+    while True:
+        print("\n  Vínculos cadastrados:")
+        if vinculos:
+            for cliente, divisao in sorted(vinculos.items()):
+                print(f"    {cliente} → {divisao}")
+        else:
+            print("    (nenhum vínculo cadastrado)")
+
+        ult = ajustes.get("ultima_alteracao", "")
+        usr = ajustes.get("usuario", "")
+        if ult:
+            print(f"\n  Última alteração: {ult} | Usuário: {usr}")
+
+        print("\n  A - Adicionar  E - Editar  R - Remover  V - Voltar ao menu")
+        opcao = input("Opção: ").strip().upper()
+
+        if opcao == "V":
+            break
+        elif opcao == "A":
+            cliente = input("  Cliente (10 dígitos): ").strip()
+            if not re.fullmatch(r"\d{10}", cliente):
+                print("  ✗ Cliente deve ter exatamente 10 dígitos numéricos.")
+                continue
+            divisao = input("  Divisão: ").strip().upper()
+            if not divisao:
+                print("  ✗ Divisão não pode ser vazia.")
+                continue
+            if cliente in vinculos:
+                print(f"  Aviso: substituindo vínculo existente ({cliente} → {vinculos[cliente]}).")
+            vinculos[cliente] = divisao
+            salvar_ajustes_manuais(ajustes, logger)
+            print(f"  ✓ Vínculo adicionado: {cliente} → {divisao}")
+        elif opcao == "E":
+            cliente = input("  Cliente a editar: ").strip()
+            if cliente not in vinculos:
+                print(f"  ✗ Cliente '{cliente}' não encontrado nos ajustes.")
+                continue
+            print(f"  Valor atual: {cliente} → {vinculos[cliente]}")
+            divisao = input("  Nova Divisão: ").strip().upper()
+            if not divisao:
+                print("  ✗ Divisão não pode ser vazia.")
+                continue
+            vinculos[cliente] = divisao
+            salvar_ajustes_manuais(ajustes, logger)
+            print(f"  ✓ Vínculo atualizado: {cliente} → {divisao}")
+        elif opcao == "R":
+            cliente = input("  Cliente a remover: ").strip()
+            if cliente not in vinculos:
+                print(f"  ✗ Cliente '{cliente}' não encontrado nos ajustes.")
+                continue
+            divisao_removida = vinculos.pop(cliente)
+            salvar_ajustes_manuais(ajustes, logger)
+            print(f"  ✓ Vínculo removido: {cliente} → {divisao_removida}")
+        else:
+            print(f"  ✗ Opção inválida: '{opcao}'. Use A, E, R ou V.")
+
+    print(f"  LOG: {caminho_log}")
+
+
+# ---------------------------------------------------------------------------
+# RESOLUÇÃO DO DESTINO
+# ---------------------------------------------------------------------------
+
+def resolver_destino(
+    conta: str,
+    cliente: str,
+    ajustes_manuais: dict,
+    idx_consolida: dict,
+) -> tuple:
+    """
+    Resolve o Destino de uma linha de movimentação com a seguinte precedência:
+
+    (a) De-para por Conta — prioridade máxima (CONTAS_DESTINO_POR_CONTA).
+    (b) Prefixo 120206* (≠1202060000 e não consta nas específicas de (a))
+        → Destino = "Parceiro".
+    (c) Ajuste manual por Cliente (ajustes_manuais.json) — sobrepõe ZFIT009.
+    (d) ZFIT009 por Cliente (via tabela de consolidação carregada).
+
+    Retorna (destino: str, regra: str) onde regra é uma das strings:
+        'conta_especifica' | 'parceiro' | 'ajuste_manual' | 'zfit009' | 'sem_destino'
+    """
+    # (a) Conta com mapeamento explícito
+    destino_conta = CONTAS_DESTINO_POR_CONTA.get(conta)
+    if destino_conta:
+        return destino_conta, "conta_especifica"
+
+    # (b) Prefixo 120206* exceto a conta base e as já mapeadas em (a)
+    if (
+        conta.startswith(PREFIXO_MUTUO_LONGO)
+        and conta != CONTA_MUTUO_BASE
+        and conta not in CONTAS_DESTINO_POR_CONTA
+    ):
+        return "Parceiro", "parceiro"
+
+    # (c) Ajuste manual por Cliente (tem prioridade sobre ZFIT009)
+    vinculos = ajustes_manuais.get("vinculos", {}) if isinstance(ajustes_manuais, dict) else {}
+    if cliente and cliente in vinculos:
+        return vinculos[cliente], "ajuste_manual"
+
+    # (d) ZFIT009 via tabela de consolidação
+    correspondencias = idx_consolida.get(cliente, [])
+    if correspondencias:
+        divs = sorted({d for d, _ in correspondencias if d})
+        if divs:
+            return ";".join(divs), "zfit009"
+
+    return "", "sem_destino"
+
+
 def calcular_saldo_final_fluxo(
     saldo_inicial: float,
     adicoes: float,
@@ -2065,6 +2380,7 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
     idx_classif = None
     idx_status = None
     idx_montante = IDX_MONTANTE
+    idx_conta = IDX_CONTA  # detectado dinamicamente do cabeçalho (item 5)
 
     for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
         tp = tipo_de_linha(linha)
@@ -2078,12 +2394,14 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
                     idx_status = i
                 if "montante" in c_norm:
                     idx_montante = i
+                if c_norm == "conta":
+                    idx_conta = i
             continue
         if tp != "dado":
             continue
 
         campos = parse_linha(linha)
-        conta = campos[IDX_CONTA].strip() if len(campos) > IDX_CONTA else ""
+        conta = campos[idx_conta].strip() if len(campos) > idx_conta else ""
         if not conta.startswith(PREFIXO_MUTUO):
             continue
 
@@ -2094,7 +2412,8 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
             totais[classif] += montante
 
         status = campos[idx_status].strip() if idx_status is not None and len(campos) > idx_status else ""
-        if status == "Elimina":
+        # "S" é o novo rótulo de eliminação (era "Elimina") — item 4
+        if status == "S":
             eliminacoes += montante
             elimina_linhas += 1
 
@@ -2296,6 +2615,7 @@ def gerar_resumo(
     # Detectar índice da coluna Classificação a partir do cabeçalho
     idx_classif = None
     idx_montante_resumo = IDX_MONTANTE  # padrão; recalculado ao ler o cabeçalho
+    idx_conta_resumo = IDX_CONTA       # detectado dinamicamente (item 5)
 
     totais: dict = {}
     contagens_linhas: dict = {}
@@ -2307,10 +2627,13 @@ def gerar_resumo(
             if tp == "cabecalho":
                 campos = parse_linha(linha)
                 for i, c in enumerate(campos):
-                    if "Classificação" in c or "Classificacao" in c:
+                    c_n = c.strip().lower()
+                    if "classificação" in c_n or "classificacao" in c_n:
                         idx_classif = i
-                    if "Montante" in c:
+                    if "montante" in c_n:
                         idx_montante_resumo = i
+                    if c_n == "conta":
+                        idx_conta_resumo = i
                 continue
 
             if tp != "dado":
@@ -2319,7 +2642,7 @@ def gerar_resumo(
             campos = parse_linha(linha)
 
             # Somente linhas de Mútuo (1202*) entram nos totais
-            conta = campos[IDX_CONTA].strip() if len(campos) > IDX_CONTA else ""
+            conta = campos[idx_conta_resumo].strip() if len(campos) > idx_conta_resumo else ""
             if not conta.startswith(PREFIXO_MUTUO):
                 continue
 
@@ -2327,8 +2650,8 @@ def gerar_resumo(
             if idx_classif is not None and len(campos) > idx_classif:
                 classif = campos[idx_classif].strip()
 
-            # Ignorar linhas de Mútuo sem classificação no resumo
-            if not classif:
+            # Ignorar linhas sem classificação real no resumo (inclui "N/A" — item 3)
+            if not classif or classif == "N/A":
                 continue
 
             montante = None
@@ -2920,6 +3243,7 @@ def mostrar_menu_principal() -> str:
     print("  7 - Informar/atualizar Saldo Inicial")
     print("  8 - Resumo (Saldo Inicial → Saldo Final)")
     print("  9 - Executar tudo em sequência")
+    print("  A - Ajustes Manuais (de-para Cliente → Divisão)")
     print("  0 - Sair")
     print("-" * 60)
     return input("Opção: ").strip()
@@ -2958,13 +3282,18 @@ def main() -> None:
         if opcao == "0":
             print("Saindo. Até logo!")
             break
+        elif opcao.upper() == "A":
+            try:
+                menu_ajustes_manuais(logger, caminho_log)
+            except KeyboardInterrupt:
+                print("\nOperação interrompida. Voltando ao menu.")
         elif opcao in acoes:
             try:
                 acoes[opcao](logger, caminho_log)
             except KeyboardInterrupt:
                 print("\nOperação interrompida. Voltando ao menu.")
         else:
-            print(f"  ✗ Opção inválida: '{opcao}'. Digite 0 a 9.")
+            print(f"  ✗ Opção inválida: '{opcao}'. Digite 0-9 ou A.")
 
 
 if __name__ == "__main__":
