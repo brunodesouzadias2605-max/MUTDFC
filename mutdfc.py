@@ -1229,8 +1229,14 @@ def validar_zco059(
     cabecalho_encontrado: bool,
     erro_validacao: str,
     logger: logging.Logger,
+    exigir_descricao: bool = False,
 ) -> bool:
-    """Valida a ZCO059 já parseada e garante colunas corretas para a consolidação."""
+    """
+    Valida a ZCO059 já parseada e garante colunas corretas para a consolidação.
+
+    Quando exigir_descricao=True (import via SAP), verifica se a coluna Descrição
+    está preenchida corretamente (Individual/Controladas) e falha se estiver faltando.
+    """
     if not os.path.isfile(caminho):
         logger.error("Arquivo ZCO059 não encontrado: '%s'", caminho)
         return False
@@ -1256,6 +1262,21 @@ def validar_zco059(
             len(invalidos),
         )
         return False
+
+    # Validar presença da coluna Descrição quando exigido (import SAP)
+    if exigir_descricao:
+        sem_descricao = [
+            item for item in registros
+            if item.get("Descrição", "") not in {"Individual", "Controladas"}
+        ]
+        if sem_descricao:
+            logger.error(
+                "ZCO059 com Descrição ausente ou inválida em %d linha(s). "
+                "O export SAP deve conter 4 colunas (Empresa|Divisão|Descrição|Consolida). "
+                "Exporte manualmente via ZCO059.vbs e use a opção de importar por arquivo.",
+                len(sem_descricao),
+            )
+            return False
 
     logger.info(
         "ZCO059 validada com sucesso: %d linha(s) válidas e %d divisões únicas.",
@@ -1561,7 +1582,14 @@ def _selecionar_colunas_zco059(session, logger: logging.Logger, tentativas: int 
                     raise RuntimeError("Grid do popup de colunas indisponível.")
                 return session.findById(_ZCO059_COL_SHELL)
 
-            logger.debug("ZCO059 SAP [2]: popup de colunas pronto; replicando sequência do VBS.")
+            # Sequência correta (do VBS) para 4 colunas: Empresa|Divisão|Descrição|Consolida
+            # - press (inicial)
+            # - currentCellRow = 1 ; press
+            # - currentCellRow = 2 ; press + 7 presses adicionais
+            # - currentCellRow = 4 ; press (Descrição)
+            # - currentCellRow = 2 ; press (posicionamento final)
+            # - btn[0].press (OK)
+            logger.debug("ZCO059 SAP [2]: popup de colunas pronto; replicando sequência do VBS (4 colunas).")
             _botao_colunas().press()
             time.sleep(0.3)
 
@@ -1582,11 +1610,17 @@ def _selecionar_colunas_zco059(session, logger: logging.Logger, tentativas: int 
                 logger.debug("ZCO059 SAP [2]: press adicional %d/7 em btnAPP_FL_SING.", indice + 1)
                 time.sleep(0.2)
 
-            _grid_colunas().currentCellRow = 3
-            logger.debug("ZCO059 SAP [2]: currentCellRow = 3.")
+            # Passo adicional para incluir coluna Descrição (row 4)
+            _grid_colunas().currentCellRow = 4
+            logger.debug("ZCO059 SAP [2]: currentCellRow = 4 (Descrição).")
             time.sleep(0.2)
             _botao_colunas().press()
             time.sleep(0.3)
+
+            # Posicionamento final (row 2, conforme VBS)
+            _grid_colunas().currentCellRow = 2
+            logger.debug("ZCO059 SAP [2]: currentCellRow = 2 (posicionamento final).")
+            time.sleep(0.2)
 
             if not esperar_controle(session, _ZCO059_COL_OK, timeout=10.0, logger=logger):
                 raise RuntimeError("Botão OK do popup de colunas indisponível.")
@@ -1709,7 +1743,12 @@ def importar_zco059_sap(session, pasta_tabelas: str, logger: logging.Logger):
         cabecalho_encontrado,
         erro_validacao,
         logger,
+        exigir_descricao=True,  # Export SAP deve ter 4 colunas
     ):
+        logger.error(
+            "ERROR: O export SAP da ZCO059 não contém 4 colunas (Empresa|Divisão|Descrição|Consolida). "
+            "Exporte manualmente via ZCO059Consolidadas.vbs e use a opção de importar por arquivo."
+        )
         try:
             os.remove(caminho_tmp)
         except OSError:
