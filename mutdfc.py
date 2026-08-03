@@ -149,22 +149,21 @@ COLUNAS_REMOVER_SAIDA = {"St", "Atribuição", "Imobilizado", "DiagRede", "Statu
 CONTAS_CONTRAPARTIDA_AUDITORIA = {CONTA_JUROS, CONTA_IRRF, CONTA_IOF}
 
 # Ordem fixa do resumo em estrutura de fluxo (Relatório de Auditoria)
-# Ordem: (1) Período de Referência [cabeçalho], (2) Saldo Inicial, (3) Adições,
-# (4) Baixas, (5) Transferências [se existir], (6) Reclassificações [se existir],
-# (7) Outros Movimentos [se existir], (8) Ajustes [inclui Juros, IOF, IRRF e Eliminações], (9) Saldo Final
+# Issue #19: 8 linhas fixas de dados (excluindo cabeçalho do período)
+# Conforme README.md: Saldo Inicial, Adições, (-) Eliminações, Juros, IOF, IRRF, Baixas, Saldo Final
 _ORDEM_FLUXO = [
     "Saldo Inicial",
     "Adições",
+    "(-) Eliminações",
+    "Juros",
+    "IOF",
+    "IRRF",
     "Baixas",
-    "Transferências",
-    "Reclassificações",
-    "Outros Movimentos",
-    "Ajustes",
     "Saldo Final",
 ]
 
-# Classificações que compõem a linha "Ajustes" no resumo
-_AJUSTES_COMPONENTES = {"Juros", "IOF", "IRRF", "Eliminações de Adições", "Eliminações de Baixas"}
+# Contas de classificação usadas no resumo de fluxo
+_CLASSIFICACOES_FLUXO = {"Adições", "Juros", "IOF", "IRRF", "Baixa"}
 
 # Sentinel retornado por extrair_razao() quando o dia não tem partidas.
 # Distingue "sem dados" (fluxo normal) de None (falha/erro).
@@ -2512,34 +2511,35 @@ def calcular_saldo_final_fluxo(
 
 def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logging.Logger):
     """
-    Gera resumo de fluxo (CSV + Excel) para auditoria conforme requisitos Issue #17.
+    Gera resumo de fluxo (CSV + Excel) para auditoria conforme requisitos Issue #19.
     
-    ESTRUTURA DO RESUMO EXECUTIVO (somente 2 colunas de valor):
-        Descrição | Individual | Consolidado
-        (Controladas é usado internamente mas NÃO exibido no resumo)
+    ESTRUTURA DO RESUMO EXECUTIVO (9 linhas fixas, 3 colunas de valor):
+        Descrição | Individual | Controladas | Consolidado
     
-    ORDEM DAS LINHAS:
-        (1) Período de Referência [cabeçalho destacado]
-        (2) Saldo Inicial
-        (3) Adições
-        (4) Baixas
-        (5) Transferências [se existir]
-        (6) Reclassificações [se existir]
-        (7) Outros Movimentos [se existir]
-        (8) Ajustes [inclui Juros, IOF, IRRF e Eliminações]
-        (9) Saldo Final = soma algébrica das linhas 2..8
+    ORDEM DAS LINHAS (9 linhas fixas):
+        (1) Saldo Inicial
+        (2) Adições
+        (3) (-) Eliminações (com sinal invertido)
+        (4) Juros
+        (5) IOF
+        (6) IRRF
+        (7) Baixas
+        (8) Saldo Final = Saldo Inicial + Adições − Eliminações + Juros + IOF − IRRF − Baixas
     
-    ELIMINAÇÕES segregadas:
-        - "Eliminações de Adições" → sinal invertido (Adição +1000 → -1000)
-        - "Eliminações de Baixas" → sinal invertido (Baixa -500 → +500)
+    ELIMINAÇÕES:
+        - Soma de TODAS as linhas com Consolida="S" (qualquer classificação)
+        - Apresentado com sinal invertido (se soma original é +1000 → mostrar -1000)
     
     VALORES:
         - Em MILHARES de reais (÷1000), sem decimais, separador de milhar BR
         - Negativos em VERMELHO com parênteses: (851)
     
     VALIDAÇÃO:
-        - Saldo Final == soma algébrica das linhas 2..8 por coluna
+        - Saldo Final conforme fórmula do README.md
         - Composição analítica reconciliada com cada linha do resumo
+    
+    FONTE DE DADOS:
+        - Arquivo Classificado_ (razão final) é a única fonte de dados
     """
     if not os.path.isfile(arquivo_classificado):
         logger.error("Arquivo classificado não encontrado: '%s'", arquivo_classificado)
@@ -2574,11 +2574,10 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
     totais_individual = defaultdict(float)
     totais_controladas = defaultdict(float)
     
-    # Eliminações segregadas por tipo (Adições vs Baixas)
-    elim_adicoes_individual = 0.0
-    elim_adicoes_controladas = 0.0
-    elim_baixas_individual = 0.0
-    elim_baixas_controladas = 0.0
+    # Eliminações totais: soma de TODAS as linhas com Consolida="S" (qualquer classificação)
+    # Apresentadas com sinal invertido no resumo
+    elim_individual = 0.0
+    elim_controladas = 0.0
     
     # Composição analítica: lista de todos os lançamentos para rastreabilidade
     composicao_analitica = []
@@ -2666,21 +2665,12 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
         else:
             totais_controladas[classif] += montante
         
-        # Eliminações segregadas por tipo: Consolida="S" indica eliminação
-        # O tipo de eliminação depende da classificação original
+        # Eliminações: soma de TODAS as linhas com Consolida="S" (qualquer classificação)
         if consolida == "S":
-            if classif == "Adições":
-                if is_individual:
-                    elim_adicoes_individual += montante
-                else:
-                    elim_adicoes_controladas += montante
-            elif classif == "Baixa":
-                if is_individual:
-                    elim_baixas_individual += montante
-                else:
-                    elim_baixas_controladas += montante
-            # Outras classificações com Consolida=S vão para eliminações genéricas
-            # (podem ser IOF, IRRF, Juros etc.)
+            if is_individual:
+                elim_individual += montante
+            else:
+                elim_controladas += montante
 
     # Extrair datas do período do arquivo para o cabeçalho
     data_ini_str, data_fim_str = _extrair_datas_do_nome(os.path.basename(arquivo_classificado))
@@ -2690,115 +2680,130 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
     periodo_cabecalho = f"RELATÓRIO DE MOVIMENTAÇÃO — Período: {data_ini_fmt} a {data_fim_fmt}"
 
     # --------------------------------------------------
-    # CONSTRUIR LINHAS DO RESUMO EXECUTIVO
-    # Ordem: Saldo Inicial, Adições, Baixas, Transferências, Reclassificações,
-    #        Outros Movimentos, Ajustes, Saldo Final
+    # CONSTRUIR LINHAS DO RESUMO EXECUTIVO — 9 LINHAS FIXAS
+    # Conforme README.md Issue #19:
+    # Saldo Inicial, Adições, (-) Eliminações, Juros, IOF, IRRF, Baixas, Saldo Final
+    # Cada linha tem 4 elementos: (descrição, individual, controladas, consolidado)
     # --------------------------------------------------
     
-    # Linha 2: Saldo Inicial (valores persistidos)
-    linha_saldo_inicial = ("Saldo Inicial", saldo_individual, saldo_consolidado)
+    # Linha 1: Saldo Inicial (valores persistidos)
+    linha_saldo_inicial = ("Saldo Inicial", saldo_individual, saldo_controladas, saldo_consolidado)
     
-    # Linha 3: Adições (soma das adições MENOS eliminações de adições com sinal invertido)
+    # Linha 2: Adições (soma das adições brutas, sem deduzir eliminações)
     adicoes_ind = totais_individual.get("Adições", 0.0)
     adicoes_ctrl = totais_controladas.get("Adições", 0.0)
-    # Eliminações de Adições: sinal invertido (Adição +1000 → eliminação -1000)
-    adicoes_ind_liquido = adicoes_ind - elim_adicoes_individual
-    adicoes_ctrl_liquido = adicoes_ctrl - elim_adicoes_controladas
-    adicoes_cons = adicoes_ind_liquido + adicoes_ctrl_liquido
-    linha_adicoes = ("Adições", adicoes_ind_liquido, adicoes_cons)
+    adicoes_cons = adicoes_ind + adicoes_ctrl
+    linha_adicoes = ("Adições", adicoes_ind, adicoes_ctrl, adicoes_cons)
     
-    # Linha 4: Baixas (valores negativos por natureza)
-    # Eliminações de Baixas: sinal invertido (Baixa -500 → eliminação +500)
-    baixas_ind = totais_individual.get("Baixa", 0.0)
-    baixas_ctrl = totais_controladas.get("Baixa", 0.0)
-    baixas_ind_liquido = baixas_ind + elim_baixas_individual  # Invertido: reduz o efeito negativo
-    baixas_ctrl_liquido = baixas_ctrl + elim_baixas_controladas
-    baixas_cons = baixas_ind_liquido + baixas_ctrl_liquido
-    linha_baixas = ("Baixas", baixas_ind_liquido, baixas_cons)
+    # Linha 3: (-) Eliminações = soma de TODAS as linhas com Consolida="S"
+    # Apresentado com sinal invertido conforme README.md
+    # Se soma original é +1000, mostrar -1000 (sinal negativo)
+    elim_ind_invertido = -elim_individual
+    elim_ctrl_invertido = -elim_controladas
+    elim_cons_invertido = elim_ind_invertido + elim_ctrl_invertido
+    linha_eliminacoes = ("(-) Eliminações", elim_ind_invertido, elim_ctrl_invertido, elim_cons_invertido)
     
-    # Linha 5: Transferências (se existir)
-    transf_ind = totais_individual.get("Transferências", 0.0) + totais_individual.get("Transferencia", 0.0)
-    transf_ctrl = totais_controladas.get("Transferências", 0.0) + totais_controladas.get("Transferencia", 0.0)
-    transf_cons = transf_ind + transf_ctrl
-    linha_transferencias = ("Transferências", transf_ind, transf_cons) if (transf_ind != 0 or transf_ctrl != 0) else None
-    
-    # Linha 6: Reclassificações (se existir)
-    reclass_ind = totais_individual.get("Reclassificações", 0.0) + totais_individual.get("Reclassificação", 0.0)
-    reclass_ctrl = totais_controladas.get("Reclassificações", 0.0) + totais_controladas.get("Reclassificação", 0.0)
-    reclass_cons = reclass_ind + reclass_ctrl
-    linha_reclassificacoes = ("Reclassificações", reclass_ind, reclass_cons) if (reclass_ind != 0 or reclass_ctrl != 0) else None
-    
-    # Linha 7: Outros Movimentos (se existir)
-    outros_ind = totais_individual.get("Outros", 0.0) + totais_individual.get("Outros Movimentos", 0.0)
-    outros_ctrl = totais_controladas.get("Outros", 0.0) + totais_controladas.get("Outros Movimentos", 0.0)
-    outros_cons = outros_ind + outros_ctrl
-    linha_outros = ("Outros Movimentos", outros_ind, outros_cons) if (outros_ind != 0 or outros_ctrl != 0) else None
-    
-    # Linha 8: Ajustes (inclui Juros, IOF, IRRF)
+    # Linha 4: Juros
     juros_ind = totais_individual.get("Juros", 0.0)
     juros_ctrl = totais_controladas.get("Juros", 0.0)
+    juros_cons = juros_ind + juros_ctrl
+    linha_juros = ("Juros", juros_ind, juros_ctrl, juros_cons)
+    
+    # Linha 5: IOF
     iof_ind = totais_individual.get("IOF", 0.0)
     iof_ctrl = totais_controladas.get("IOF", 0.0)
+    iof_cons = iof_ind + iof_ctrl
+    linha_iof = ("IOF", iof_ind, iof_ctrl, iof_cons)
+    
+    # Linha 6: IRRF
     irrf_ind = totais_individual.get("IRRF", 0.0)
     irrf_ctrl = totais_controladas.get("IRRF", 0.0)
+    irrf_cons = irrf_ind + irrf_ctrl
+    linha_irrf = ("IRRF", irrf_ind, irrf_ctrl, irrf_cons)
     
-    ajustes_ind = juros_ind + iof_ind + irrf_ind
-    ajustes_ctrl = juros_ctrl + iof_ctrl + irrf_ctrl
-    ajustes_cons = ajustes_ind + ajustes_ctrl
-    linha_ajustes = ("Ajustes", ajustes_ind, ajustes_cons)
+    # Linha 7: Baixas
+    baixas_ind = totais_individual.get("Baixa", 0.0)
+    baixas_ctrl = totais_controladas.get("Baixa", 0.0)
+    baixas_cons = baixas_ind + baixas_ctrl
+    linha_baixas = ("Baixas", baixas_ind, baixas_ctrl, baixas_cons)
     
-    # Montar lista de linhas do resumo (excluindo None)
-    linhas_resumo = [linha_saldo_inicial, linha_adicoes, linha_baixas]
-    if linha_transferencias:
-        linhas_resumo.append(linha_transferencias)
-    if linha_reclassificacoes:
-        linhas_resumo.append(linha_reclassificacoes)
-    if linha_outros:
-        linhas_resumo.append(linha_outros)
-    linhas_resumo.append(linha_ajustes)
+    # Linha 8: Saldo Final usando fórmula do README.md:
+    # Saldo Final = Saldo Inicial + Adições − Eliminações + Juros + IOF − IRRF − Baixas
+    # Nota: Eliminações já está com sinal invertido, então a fórmula usa + elim_*_invertido
+    saldo_final_ind = calcular_saldo_final_fluxo(
+        saldo_individual, adicoes_ind, elim_individual, juros_ind, iof_ind, irrf_ind, baixas_ind
+    )
+    saldo_final_ctrl = calcular_saldo_final_fluxo(
+        saldo_controladas, adicoes_ctrl, elim_controladas, juros_ctrl, iof_ctrl, irrf_ctrl, baixas_ctrl
+    )
+    saldo_final_cons = saldo_final_ind + saldo_final_ctrl
+    linha_saldo_final = ("Saldo Final", saldo_final_ind, saldo_final_ctrl, saldo_final_cons)
     
-    # Linha 9: Saldo Final = soma algébrica das linhas 2..8 (cada uma com seu sinal)
-    # IMPORTANTE: Saldo Final NÃO é pré-calculado independentemente;
-    # é a soma das linhas exibidas no resumo
-    saldo_final_ind = sum(linha[1] for linha in linhas_resumo)
-    saldo_final_cons = sum(linha[2] for linha in linhas_resumo)
-    linha_saldo_final = ("Saldo Final", saldo_final_ind, saldo_final_cons)
-    
-    # Adicionar Saldo Final à lista
-    linhas_resumo.append(linha_saldo_final)
+    # Montar lista de linhas do resumo (9 linhas fixas)
+    linhas_resumo = [
+        linha_saldo_inicial,    # 1
+        linha_adicoes,          # 2
+        linha_eliminacoes,      # 3
+        linha_juros,            # 4
+        linha_iof,              # 5
+        linha_irrf,             # 6
+        linha_baixas,           # 7
+        linha_saldo_final,      # 8
+    ]
     
     # --------------------------------------------------
-    # VALIDAÇÃO: Saldo Final == soma algébrica das linhas 2..8
+    # VALIDAÇÃO: Saldo Final conforme fórmula do README.md
     # --------------------------------------------------
-    soma_validacao_ind = sum(linha[1] for linha in linhas_resumo[:-1])  # Excluir Saldo Final
-    soma_validacao_cons = sum(linha[2] for linha in linhas_resumo[:-1])
+    # Verificar se Saldo Final == Saldo Inicial + Adições − Eliminações + Juros + IOF − IRRF − Baixas
+    validacao_ind = saldo_individual + adicoes_ind - elim_individual + juros_ind + iof_ind - irrf_ind - baixas_ind
+    validacao_ctrl = saldo_controladas + adicoes_ctrl - elim_controladas + juros_ctrl + iof_ctrl - irrf_ctrl - baixas_ctrl
+    validacao_cons = validacao_ind + validacao_ctrl
     
-    diff_ind = abs(saldo_final_ind - soma_validacao_ind)
-    diff_cons = abs(saldo_final_cons - soma_validacao_cons)
+    diff_ind = abs(saldo_final_ind - validacao_ind)
+    diff_ctrl = abs(saldo_final_ctrl - validacao_ctrl)
+    diff_cons = abs(saldo_final_cons - validacao_cons)
     
     if diff_ind > 0.01:
         logger.warning(
-            "VALIDAÇÃO: Divergência no Saldo Final Individual: calculado=%s, soma=%s, diff=%s",
+            "VALIDAÇÃO: Divergência no Saldo Final Individual: calculado=%s, fórmula=%s, diff=%s",
             _formatar_valor_br(saldo_final_ind),
-            _formatar_valor_br(soma_validacao_ind),
+            _formatar_valor_br(validacao_ind),
             _formatar_valor_br(diff_ind),
         )
     else:
-        logger.info("VALIDAÇÃO OK: Saldo Final Individual = soma das linhas 2..8")
+        logger.info("VALIDAÇÃO OK: Saldo Final Individual conforme fórmula")
+    
+    if diff_ctrl > 0.01:
+        logger.warning(
+            "VALIDAÇÃO: Divergência no Saldo Final Controladas: calculado=%s, fórmula=%s, diff=%s",
+            _formatar_valor_br(saldo_final_ctrl),
+            _formatar_valor_br(validacao_ctrl),
+            _formatar_valor_br(diff_ctrl),
+        )
+    else:
+        logger.info("VALIDAÇÃO OK: Saldo Final Controladas conforme fórmula")
     
     if diff_cons > 0.01:
         logger.warning(
-            "VALIDAÇÃO: Divergência no Saldo Final Consolidado: calculado=%s, soma=%s, diff=%s",
+            "VALIDAÇÃO: Divergência no Saldo Final Consolidado: calculado=%s, fórmula=%s, diff=%s",
             _formatar_valor_br(saldo_final_cons),
-            _formatar_valor_br(soma_validacao_cons),
+            _formatar_valor_br(validacao_cons),
             _formatar_valor_br(diff_cons),
         )
     else:
-        logger.info("VALIDAÇÃO OK: Saldo Final Consolidado = soma das linhas 2..8")
+        logger.info("VALIDAÇÃO OK: Saldo Final Consolidado conforme fórmula")
+    
+    # Log de eliminações para auditoria
+    logger.info(
+        "ELIMINAÇÕES (Consolida=S): Individual=%s, Controladas=%s, Total=%s",
+        _formatar_valor_br(elim_individual),
+        _formatar_valor_br(elim_controladas),
+        _formatar_valor_br(elim_individual + elim_controladas),
+    )
 
     # --------------------------------------------------
     # EXPORTAR CSV (valores em milhares, formato BR)
-    # Colunas: Descrição | Individual | Consolidado (sem Controladas)
+    # Colunas: Descrição | Individual | Controladas | Consolidado
     # --------------------------------------------------
     nome_csv = f"Resumo_{data_ini_str}_a_{data_fim_str}.csv"
     caminho_csv = os.path.join(pasta_saida, nome_csv)
@@ -2806,11 +2811,11 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
 
     with open(caminho_csv, "w", encoding="utf-8-sig", newline="") as f:
         # Cabeçalho do período
-        f.write(f"{periodo_cabecalho}||\n")
-        f.write("Descrição|Individual|Consolidado\n")
-        for descr, ind, cons in linhas_resumo:
+        f.write(f"{periodo_cabecalho}|||\n")
+        f.write("Descrição|Individual|Controladas|Consolidado\n")
+        for descr, ind, ctrl, cons in linhas_resumo:
             # Valores em milhares
-            f.write(f"{descr}|{_formatar_valor_milhares(ind)}|{_formatar_valor_milhares(cons)}\n")
+            f.write(f"{descr}|{_formatar_valor_milhares(ind)}|{_formatar_valor_milhares(ctrl)}|{_formatar_valor_milhares(cons)}\n")
 
     # --------------------------------------------------
     # EXPORTAR EXCEL com formatação profissional
@@ -2827,14 +2832,14 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
     # --------------------------------------------------
     # EXIBIR RESUMO NO CONSOLE (em milhares)
     # --------------------------------------------------
-    separador = "-" * 70
+    separador = "-" * 90
     print(separador)
     print(f"  {periodo_cabecalho}")
     print(separador)
-    print(f"  {'Descrição':<25} {'Individual':>18} {'Consolidado':>18}")
+    print(f"  {'Descrição':<20} {'Individual':>18} {'Controladas':>18} {'Consolidado':>18}")
     print(separador)
-    for descr, ind, cons in linhas_resumo:
-        print(f"  {descr:<25} {_formatar_valor_milhares(ind):>18} {_formatar_valor_milhares(cons):>18}")
+    for descr, ind, ctrl, cons in linhas_resumo:
+        print(f"  {descr:<20} {_formatar_valor_milhares(ind):>18} {_formatar_valor_milhares(ctrl):>18} {_formatar_valor_milhares(cons):>18}")
     print(separador)
     print("  * Valores em milhares de reais (R$ mil)")
     print(separador)
@@ -2854,16 +2859,20 @@ def exportar_resumo_fluxo_xlsx(
     """
     Exporta resumo de fluxo para Excel com formatação profissional para auditoria.
     
-    FORMATAÇÃO (Issue #17):
+    FORMATAÇÃO (Issue #19):
     - Cabeçalho do período destacado e centralizado (verde escuro, negrito branco)
     - Valores em MILHARES de reais (÷1000), sem decimais, separador de milhar
     - Negativos em VERMELHO com parênteses
     - Saldo Inicial e Saldo Final em negrito destacados (verde claro)
+    - IRRF e Baixas em vermelho
     - Faixa laranja de separação antes do Saldo Final
     - Alinhamento numérico à direita
     
+    ESTRUTURA (9 linhas fixas, 4 colunas):
+    - Descrição | Individual | Controladas | Consolidado
+    
     ABAS:
-    - "Resumo": resumo executivo com colunas Descrição | Individual | Consolidado
+    - "Resumo": resumo executivo com 9 linhas fixas
     - "Composição Analítica": detalhamento de cada linha com rastreabilidade
     """
     try:
@@ -2876,7 +2885,7 @@ def exportar_resumo_fluxo_xlsx(
     wb = openpyxl.Workbook()
     
     # --------------------------------------------------
-    # ABA 1: RESUMO EXECUTIVO
+    # ABA 1: RESUMO EXECUTIVO (9 linhas fixas, 4 colunas)
     # --------------------------------------------------
     ws_resumo = wb.active
     ws_resumo.title = "Resumo"
@@ -2885,16 +2894,17 @@ def exportar_resumo_fluxo_xlsx(
     header_fill = PatternFill(start_color="006400", end_color="006400", fill_type="solid")  # Verde escuro
     destaque_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")  # Verde claro
     separador_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")  # Laranja
+    vermelho_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")  # Rosa claro
     negrito_branco_font = Font(bold=True, color="FFFFFF", size=12)
     negrito_font = Font(bold=True)
-    vermelho_font = Font(color="FF0000")
+    vermelho_font = Font(color="FF0000", bold=True)
     
     # Formato numérico: milhares com separador de ponto, negativo em vermelho com parênteses
     # Excel: #.##0 para positivo; [Red](#.##0) para negativo
     fmt_milhares = '#,##0;[Red](#,##0)'
     
-    # Linha 1: Cabeçalho do período (mesclado nas 3 colunas)
-    ws_resumo.merge_cells("A1:C1")
+    # Linha 1: Cabeçalho do período (mesclado nas 4 colunas)
+    ws_resumo.merge_cells("A1:D1")
     cell_periodo = ws_resumo["A1"]
     cell_periodo.value = periodo_cabecalho
     cell_periodo.font = negrito_branco_font
@@ -2902,8 +2912,8 @@ def exportar_resumo_fluxo_xlsx(
     cell_periodo.alignment = Alignment(horizontal="center", vertical="center")
     ws_resumo.row_dimensions[1].height = 30
     
-    # Linha 2: Cabeçalho das colunas
-    ws_resumo.append(["Descrição", "Individual", "Consolidado"])
+    # Linha 2: Cabeçalho das colunas (4 colunas)
+    ws_resumo.append(["Descrição", "Individual", "Controladas", "Consolidado"])
     for cell in ws_resumo[2]:
         cell.font = negrito_font
         cell.fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")  # Cinza claro
@@ -2911,43 +2921,50 @@ def exportar_resumo_fluxo_xlsx(
     
     # Linhas de dados (a partir da linha 3)
     linha_atual = 3
-    for descr, ind, cons in linhas_resumo:
+    for descr, ind, ctrl, cons in linhas_resumo:
         # Converter para milhares (inteiro)
         ind_milhares = _formatar_valor_milhares_excel(ind)
+        ctrl_milhares = _formatar_valor_milhares_excel(ctrl)
         cons_milhares = _formatar_valor_milhares_excel(cons)
         
         ws_resumo.cell(row=linha_atual, column=1, value=descr)
         ws_resumo.cell(row=linha_atual, column=2, value=ind_milhares)
-        ws_resumo.cell(row=linha_atual, column=3, value=cons_milhares)
+        ws_resumo.cell(row=linha_atual, column=3, value=ctrl_milhares)
+        ws_resumo.cell(row=linha_atual, column=4, value=cons_milhares)
         
-        # Formatação numérica e alinhamento
-        ws_resumo.cell(row=linha_atual, column=2).number_format = fmt_milhares
-        ws_resumo.cell(row=linha_atual, column=2).alignment = Alignment(horizontal="right")
-        ws_resumo.cell(row=linha_atual, column=3).number_format = fmt_milhares
-        ws_resumo.cell(row=linha_atual, column=3).alignment = Alignment(horizontal="right")
+        # Formatação numérica e alinhamento para colunas B, C, D
+        for col in (2, 3, 4):
+            ws_resumo.cell(row=linha_atual, column=col).number_format = fmt_milhares
+            ws_resumo.cell(row=linha_atual, column=col).alignment = Alignment(horizontal="right")
         
-        # Destaque para Saldo Inicial e Saldo Final
+        # Destaque para Saldo Inicial e Saldo Final (verde claro)
         if descr in {"Saldo Inicial", "Saldo Final"}:
-            for c in range(1, 4):
+            for c in range(1, 5):
                 ws_resumo.cell(row=linha_atual, column=c).font = negrito_font
                 ws_resumo.cell(row=linha_atual, column=c).fill = destaque_fill
+        
+        # IRRF e Baixas em vermelho conforme README.md
+        if descr in {"IRRF", "Baixas"}:
+            for c in range(1, 5):
+                ws_resumo.cell(row=linha_atual, column=c).font = vermelho_font
+                ws_resumo.cell(row=linha_atual, column=c).fill = vermelho_fill
         
         # Faixa laranja antes do Saldo Final
         if descr == "Saldo Final" and linha_atual > 3:
             # Inserir linha de separação
             ws_resumo.insert_rows(linha_atual)
-            for c in range(1, 4):
+            for c in range(1, 5):
                 ws_resumo.cell(row=linha_atual, column=c).fill = separador_fill
             linha_atual += 1
             # Re-inserir a linha do Saldo Final após a separação
             ws_resumo.cell(row=linha_atual, column=1, value=descr)
             ws_resumo.cell(row=linha_atual, column=2, value=ind_milhares)
-            ws_resumo.cell(row=linha_atual, column=3, value=cons_milhares)
-            ws_resumo.cell(row=linha_atual, column=2).number_format = fmt_milhares
-            ws_resumo.cell(row=linha_atual, column=2).alignment = Alignment(horizontal="right")
-            ws_resumo.cell(row=linha_atual, column=3).number_format = fmt_milhares
-            ws_resumo.cell(row=linha_atual, column=3).alignment = Alignment(horizontal="right")
-            for c in range(1, 4):
+            ws_resumo.cell(row=linha_atual, column=3, value=ctrl_milhares)
+            ws_resumo.cell(row=linha_atual, column=4, value=cons_milhares)
+            for col in (2, 3, 4):
+                ws_resumo.cell(row=linha_atual, column=col).number_format = fmt_milhares
+                ws_resumo.cell(row=linha_atual, column=col).alignment = Alignment(horizontal="right")
+            for c in range(1, 5):
                 ws_resumo.cell(row=linha_atual, column=c).font = negrito_font
                 ws_resumo.cell(row=linha_atual, column=c).fill = destaque_fill
         
@@ -2958,10 +2975,11 @@ def exportar_resumo_fluxo_xlsx(
     ws_resumo.cell(row=linha_atual, column=1, value="* Valores em milhares de reais (R$ mil)")
     ws_resumo.cell(row=linha_atual, column=1).font = Font(italic=True, size=9)
     
-    # Larguras de coluna
-    ws_resumo.column_dimensions["A"].width = 25
-    ws_resumo.column_dimensions["B"].width = 18
-    ws_resumo.column_dimensions["C"].width = 18
+    # Larguras de coluna (4 colunas)
+    ws_resumo.column_dimensions["A"].width = 22
+    ws_resumo.column_dimensions["B"].width = 16
+    ws_resumo.column_dimensions["C"].width = 16
+    ws_resumo.column_dimensions["D"].width = 16
     
     # Congelar cabeçalhos
     ws_resumo.freeze_panes = "A3"
