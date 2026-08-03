@@ -148,17 +148,23 @@ COLUNAS_REMOVER_SAIDA = {"St", "Atribuição", "Imobilizado", "DiagRede", "Statu
 # Contas de contrapartida movidas para auditoria após classificação
 CONTAS_CONTRAPARTIDA_AUDITORIA = {CONTA_JUROS, CONTA_IRRF, CONTA_IOF}
 
-# Ordem fixa do resumo em estrutura de fluxo
+# Ordem fixa do resumo em estrutura de fluxo (Relatório de Auditoria)
+# Ordem: (1) Período de Referência [cabeçalho], (2) Saldo Inicial, (3) Adições,
+# (4) Baixas, (5) Transferências [se existir], (6) Reclassificações [se existir],
+# (7) Outros Movimentos [se existir], (8) Ajustes [inclui Juros, IOF, IRRF e Eliminações], (9) Saldo Final
 _ORDEM_FLUXO = [
     "Saldo Inicial",
     "Adições",
-    "(-) Eliminações",
-    "Juros",
-    "IOF",
-    "IRRF",
     "Baixas",
+    "Transferências",
+    "Reclassificações",
+    "Outros Movimentos",
+    "Ajustes",
     "Saldo Final",
 ]
+
+# Classificações que compõem a linha "Ajustes" no resumo
+_AJUSTES_COMPONENTES = {"Juros", "IOF", "IRRF", "Eliminações de Adições", "Eliminações de Baixas"}
 
 # Sentinel retornado por extrair_razao() quando o dia não tem partidas.
 # Distingue "sem dados" (fluxo normal) de None (falha/erro).
@@ -383,6 +389,29 @@ def _parse_numero_br(valor_str: str):
         return -valor if negativo else valor
     except ValueError:
         return None
+
+
+def _formatar_valor_milhares(valor: float) -> str:
+    """
+    Formata float para milhares de reais (divide por 1000) no padrão brasileiro.
+    - SEM casas decimais
+    - Com separador de milhar (ponto)
+    - Mantém padrão contábil: negativo entre parênteses
+    Ex.: 12.548.963 -> 12.549 ; 1.250.000 -> 1.250 ; -850.745 -> (851)
+    """
+    milhares = round(valor / 1000)  # Arredonda para milhares sem decimais
+    abs_v = abs(milhares)
+    # Formata com separador de milhar (ponto no padrão BR)
+    s = f"{abs_v:,}".replace(",", ".")
+    return f"({s})" if milhares < 0 else s
+
+
+def _formatar_valor_milhares_excel(valor: float) -> int:
+    """
+    Retorna valor em milhares como inteiro para uso em Excel.
+    Divide por 1000 e arredonda.
+    """
+    return round(valor / 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -2209,22 +2238,49 @@ def exportar_excel_corporativo(caminho_csv: str, logger: logging.Logger):
 
 
 def carregar_saldo_inicial(logger: logging.Logger):
-    """Carrega saldo inicial persistido (se existir)."""
+    """
+    Carrega saldo inicial persistido (se existir).
+    
+    Retorna dicionário com campos:
+    - valor_individual: float
+    - valor_controladas: float
+    - valor: float (consolidado = individual + controladas, para retrocompatibilidade)
+    - periodo: str
+    - data_alteracao: str
+    - usuario: str
+    """
     if not os.path.isfile(ARQUIVO_SALDO_INICIAL):
         return None
     try:
         with open(ARQUIVO_SALDO_INICIAL, "r", encoding="utf-8") as f:
             dados = json.load(f)
         ultimo = dados.get("ultimo")
-        if ultimo and isinstance(ultimo.get("valor"), (int, float)):
+        if ultimo:
+            # Retrocompatibilidade: se só tem "valor", assume como Individual
+            if "valor_individual" not in ultimo and isinstance(ultimo.get("valor"), (int, float)):
+                ultimo["valor_individual"] = ultimo.get("valor", 0.0)
+                ultimo["valor_controladas"] = 0.0
+            # Sempre recalcula consolidado
+            valor_ind = ultimo.get("valor_individual", 0.0)
+            valor_ctrl = ultimo.get("valor_controladas", 0.0)
+            ultimo["valor"] = valor_ind + valor_ctrl
             return ultimo
     except Exception as exc:  # noqa: BLE001
         logger.warning("Falha ao ler saldo inicial persistido: %s", exc)
     return None
 
 
-def salvar_saldo_inicial(valor: float, periodo: str, logger: logging.Logger):
-    """Persiste saldo inicial e mantém histórico simples de alterações."""
+def salvar_saldo_inicial(
+    valor_individual: float,
+    valor_controladas: float,
+    periodo: str,
+    logger: logging.Logger,
+):
+    """
+    Persiste saldo inicial segregado (Individual e Controladas) e mantém histórico.
+    
+    Consolidado = Individual + Controladas (calculado automaticamente).
+    """
     os.makedirs(PASTA_BASE, exist_ok=True)
     dados = {"historico": []}
     if os.path.isfile(ARQUIVO_SALDO_INICIAL):
@@ -2236,8 +2292,11 @@ def salvar_saldo_inicial(valor: float, periodo: str, logger: logging.Logger):
         except Exception:  # noqa: BLE001
             dados = {"historico": []}
 
+    valor_consolidado = valor_individual + valor_controladas
     registro = {
-        "valor": valor,
+        "valor_individual": valor_individual,
+        "valor_controladas": valor_controladas,
+        "valor": valor_consolidado,  # Consolidado = Individual + Controladas
         "periodo": periodo,
         "data_alteracao": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "usuario": getuser(),
@@ -2249,8 +2308,10 @@ def salvar_saldo_inicial(valor: float, periodo: str, logger: logging.Logger):
         json.dump(dados, f, ensure_ascii=False, indent=2)
 
     logger.info(
-        "Saldo inicial atualizado: %s (período=%s, usuário=%s).",
-        _formatar_valor_br(valor),
+        "Saldo inicial atualizado: Individual=%s, Controladas=%s, Consolidado=%s (período=%s, usuário=%s).",
+        _formatar_valor_br(valor_individual),
+        _formatar_valor_br(valor_controladas),
+        _formatar_valor_br(valor_consolidado),
         periodo,
         registro["usuario"],
     )
@@ -3289,30 +3350,73 @@ def _executar_tratar_contrapartidas(logger: logging.Logger, caminho_log: str) ->
 
 
 def _executar_saldo_inicial(logger: logging.Logger, caminho_log: str) -> None:
-    """Opção: informa/atualiza saldo inicial persistido."""
+    """
+    Opção: informa/atualiza saldo inicial persistido.
+    
+    REQUISITO 5: Input separado para Individual e Controladas.
+    Consolidado = Individual + Controladas (calculado automaticamente, sem input direto).
+    """
     print("=" * 60)
     print("  Informar / Atualizar Saldo Inicial")
+    print("  (Individual e Controladas — Consolidado é calculado)")
     print("=" * 60)
 
     atual = carregar_saldo_inicial(logger)
     if atual:
-        print(
-            f"Saldo atual: {_formatar_valor_br(atual['valor'])} | "
-            f"Período: {atual.get('periodo', '')} | "
-            f"Atualizado em: {atual.get('data_alteracao', '')} | "
-            f"Usuário: {atual.get('usuario', '')}"
-        )
-    valor_txt = input("Novo Saldo Inicial (BR): ").strip()
-    valor = _parse_numero_br(valor_txt)
-    if valor is None:
-        print("  ✗ Valor inválido.")
-        logger.warning("Saldo inicial inválido informado: '%s'", valor_txt)
-        return
+        valor_ind = atual.get("valor_individual", atual.get("valor", 0.0))
+        valor_ctrl = atual.get("valor_controladas", 0.0)
+        valor_cons = valor_ind + valor_ctrl
+        print(f"\nSaldo atual persistido:")
+        print(f"  Individual : {_formatar_valor_br(valor_ind)}")
+        print(f"  Controladas: {_formatar_valor_br(valor_ctrl)}")
+        print(f"  Consolidado: {_formatar_valor_br(valor_cons)} (calculado)")
+        print(f"  Período    : {atual.get('periodo', '')}")
+        print(f"  Atualizado : {atual.get('data_alteracao', '')} | Usuário: {atual.get('usuario', '')}")
+        default_ind = valor_ind
+        default_ctrl = valor_ctrl
+    else:
+        default_ind = 0.0
+        default_ctrl = 0.0
+
+    print("\n  NOTA: Informe os valores SEPARADAMENTE. O Consolidado será calculado.")
+    print("  Formato aceito: padrão BR (ex.: 1.234.567,89 ou 1234567,89)")
+
+    # Input Individual
+    prompt_ind = f"Saldo Inicial INDIVIDUAL [padrão: {_formatar_valor_br(default_ind)}]: "
+    valor_ind_txt = input(prompt_ind).strip()
+    if valor_ind_txt:
+        valor_individual = _parse_numero_br(valor_ind_txt)
+        if valor_individual is None:
+            print("  ✗ Valor Individual inválido.")
+            logger.warning("Saldo inicial Individual inválido informado: '%s'", valor_ind_txt)
+            return
+    else:
+        valor_individual = default_ind
+
+    # Input Controladas
+    prompt_ctrl = f"Saldo Inicial CONTROLADAS [padrão: {_formatar_valor_br(default_ctrl)}]: "
+    valor_ctrl_txt = input(prompt_ctrl).strip()
+    if valor_ctrl_txt:
+        valor_controladas = _parse_numero_br(valor_ctrl_txt)
+        if valor_controladas is None:
+            print("  ✗ Valor Controladas inválido.")
+            logger.warning("Saldo inicial Controladas inválido informado: '%s'", valor_ctrl_txt)
+            return
+    else:
+        valor_controladas = default_ctrl
+
+    # Consolidado calculado automaticamente
+    valor_consolidado = valor_individual + valor_controladas
+    print(f"\n  → Consolidado calculado: {_formatar_valor_br(valor_consolidado)}")
+
     periodo = input("Período/Trimestre de referência: ").strip() or "não informado"
-    salvar_saldo_inicial(valor, periodo, logger)
+    salvar_saldo_inicial(valor_individual, valor_controladas, periodo, logger)
 
     print("\n" + "=" * 60)
     print("  Saldo inicial atualizado com sucesso.")
+    print(f"  Individual : {_formatar_valor_br(valor_individual)}")
+    print(f"  Controladas: {_formatar_valor_br(valor_controladas)}")
+    print(f"  Consolidado: {_formatar_valor_br(valor_consolidado)}")
     print(f"  Arquivo: {ARQUIVO_SALDO_INICIAL}")
     print(f"  LOG: {caminho_log}")
     print("=" * 60)
