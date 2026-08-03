@@ -277,36 +277,58 @@ Opção 8 gera:
 - `Resumo_<periodo>.csv`
 - `Resumo_<periodo>.xlsx`
 
-### Estrutura segregada
+### Estrutura segregada (linhas de planilha; L1 = cabeçalho)
 
-O resumo é segregado em três colunas:
+O resumo é segregado em três colunas de valor. A estrutura é fixa por linha:
 
-| Etapa | Individual | Controladas | Consolidado |
-|-------|------------|-------------|-------------|
-| Saldo Inicial | ... | ... | Individual + Controladas |
-| Adições | ... | ... | Individual + Controladas |
-| (-) Eliminações | ... | ... | Individual + Controladas |
-| Juros | ... | ... | Individual + Controladas |
-| IOF | ... | ... | Individual + Controladas |
-| IRRF | ... | ... | Individual + Controladas |
-| Baixas | ... | ... | Individual + Controladas |
-| Saldo Final | ... | ... | Individual + Controladas |
+| Linha | Etapa | Individual | Controladas | Consolidado |
+|-------|-------|------------|-------------|-------------|
+| L3 | Saldo Inicial | ... | ... | Individual + Controladas |
+| L4 | Adições | ... | ... | Individual + Controladas |
+| L5 | (-) Eliminações *(de Adições)* | ... | ... | Individual + Controladas |
+| L6 | Juros | ... | ... | Individual + Controladas |
+| L7 | IOF | ... | ... | Individual + Controladas |
+| L8 | IRRF | ... | ... | Individual + Controladas |
+| L9 | Baixas | ... | ... | Individual + Controladas |
+| L10 | (-) Eliminações *(de Baixas)* | ... | ... | Individual + Controladas |
+| L11 | Saldo Final = **soma L3:L10** | ... | ... | Individual + Controladas |
 
-- **Eliminações** = soma das linhas com `Consolida="S"` (todas as classificações), apresentadas com **sinal invertido**.
+- **Duas linhas de Eliminações**, ambas com `Consolida="S"` e **sinal invertido**:
+  - **L5** = soma das linhas de **Adições** com `Consolida="S"`.
+  - **L10** = soma das linhas de **Baixas** com `Consolida="S"`.
+- **Consolidado = Individual + Controladas** em **todas** as linhas (L3:L11).
 - **Estrutura de Consolidação**: determinada via **Div** (divisão real do lançamento) → ZCO059 (Divisão) → Descrição (Individual/Controladas).
 
-### Fórmula implementada (calibrável)
+### Saldo Final (regra anti-loop)
+
+Para cada coluna (Individual, Controladas, Consolidado), o **Saldo Final (L11)** é a
+**soma algébrica literal das células L3:L10** dessa mesma coluna (respeitando o sinal
+exibido). **Não** é usada fórmula independente nem recomputação a partir do razão.
 
 ```
-Saldo Final = Saldo Inicial + Adições − Eliminações + Juros + IOF − IRRF − Baixas
+Saldo Final (L11) = SOMA(L3:L10)   — por coluna
 ```
+
+- No `.xlsx`, a célula do Saldo Final usa **fórmula real** `=SUM(<L3>:<L10>)` por coluna.
+- **Validação que aborta**: após montar o resumo, recomputa em Python a soma de L3:L10
+  por coluna e compara com o Saldo Final; se divergir em qualquer coluna (tolerância
+  0,5 milhar), a geração é **abortada com ERROR**. O LOG registra as 3 somas L3:L10 e
+  os 3 Saldos Finais.
+
+### Detalhe: aba "Classificado" (conteúdo integral)
+
+A antiga aba "Composição Analítica" foi **removida**. Em seu lugar, o mesmo `.xlsx` do
+Resumo inclui uma aba **"Classificado"** com o **conteúdo integral** do arquivo
+`Classificado_<periodo>` (razão final classificado — todas as linhas e colunas,
+incluindo `Classificação`, `Destino`, `Consolida` e `Estrutura de Consolidação`), sem
+resumir ou agrupar.
 
 ### Formatação corporativa do Resumo .xlsx
 
 - Cabeçalho verde com texto branco em negrito
 - Saldo Inicial e Saldo Final em negrito com destaque verde claro
 - IRRF e Baixas em vermelho
-- Formato monetário BR
+- Valores em **milhares** (÷1000), sem decimais, separador de milhar BR; negativos em vermelho/parênteses
 - Faixa laranja de separação antes do Saldo Final
 
 ---
