@@ -2725,7 +2725,7 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
     # CONCILIAÇÃO (Issue #23): reconciliar base classificada x resumo x eliminações.
     # --------------------------------------------------
     labels_movimento = ["Adições", "Juros", "IOF", "IRRF", "Baixa"]
-    total_base_classificada = sum(totais_geral.values())
+    total_base_classificada = sum(totais_geral.get(k, 0.0) for k in labels_movimento)
     total_resumo_movimento = sum(totais_geral.get(k, 0.0) for k in labels_movimento)
     total_eliminado = sum(elim_por_classif.get(k, 0.0) for k in labels_movimento)
     diferenca_esperada = total_resumo_movimento - total_eliminado
