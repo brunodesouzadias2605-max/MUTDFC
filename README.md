@@ -277,43 +277,71 @@ Opção 8 gera:
 - `Resumo_<periodo>.csv`
 - `Resumo_<periodo>.xlsx`
 
-### Estrutura segregada (linhas de planilha; L1 = cabeçalho)
+### Estrutura (linhas de planilha; L1 = título, L2 = cabeçalho)
 
 O resumo é segregado em três colunas de valor. A estrutura é fixa por linha:
 
 | Linha | Etapa | Individual | Controladas | Consolidado |
 |-------|-------|------------|-------------|-------------|
-| L3 | Saldo Inicial | ... | ... | Individual + Controladas |
-| L4 | Adições | ... | ... | Individual + Controladas |
-| L5 | (-) Eliminações *(de Adições)* | ... | ... | Individual + Controladas |
-| L6 | Juros | ... | ... | Individual + Controladas |
-| L7 | IOF | ... | ... | Individual + Controladas |
-| L8 | IRRF | ... | ... | Individual + Controladas |
-| L9 | Baixas | ... | ... | Individual + Controladas |
-| L10 | (-) Eliminações *(de Baixas)* | ... | ... | Individual + Controladas |
-| L11 | Saldo Final = **soma L3:L10** | ... | ... | Individual + Controladas |
+| L3 | Saldo Inicial | valor único | 0 | valor único |
+| L4 | Adições | SOMASES por Estrutura | SOMASES por Estrutura | total − eliminações |
+| L5 | Juros | ... | ... | total − eliminações |
+| L6 | IOF | ... | ... | total − eliminações |
+| L7 | IRRF | ... | ... | total − eliminações |
+| L8 | Baixas | ... | ... | total − eliminações |
+| L9 | Saldo Final = **soma L3:L8** | ... | ... | ... |
 
-- **Duas linhas de Eliminações**, ambas com `Consolida="S"` e **sinal invertido**:
-  - **L5** = soma das linhas de **Adições** com `Consolida="S"`.
-  - **L10** = soma das linhas de **Baixas** com `Consolida="S"`.
-- **Consolidado = Individual + Controladas** em **todas** as linhas (L3:L11).
+> **Mudança conceitual (v2):** **não há** linhas de "(-) Eliminações". As
+> eliminações ficam **embutidas na coluna Consolidado** (efeito líquido em cada linha).
+
+Cálculo por linha de movimento (L4:L8), tendo a coluna A (Descrição) como chave
+contra a coluna `Classificação` do Classificado:
+
+- **Individual**  = `SOMASES(Montante ; Classificação=label ; Estrutura="Individual")`
+- **Controladas** = `SOMASES(Montante ; Classificação=label ; Estrutura="Controladas")`
+- **Consolidado** = `SOMASES(Montante ; Classificação=label)` − `SOMASES(Montante ; Classificação=label ; Consolida="S")`
+
+> **Importante:** o **Consolidado é INDEPENDENTE** (total menos eliminações
+> `Consolida="S"`); **NÃO** é Individual + Controladas. Nas linhas sem eliminação os
+> números coincidem; nas com eliminação, o Consolidado fica menor (correto).
+
 - **Estrutura de Consolidação**: determinada via **Div** (divisão real do lançamento) → ZCO059 (Divisão) → Descrição (Individual/Controladas).
+
+### Saldo Inicial (input único)
+
+O **Saldo Inicial** (opção 7) é um **input único**. O valor informado vai para
+**Individual** E **Consolidado**; **Controladas = 0**. Não é solicitado valor de
+Controladas. O valor é persistido em `saldo_inicial.json`.
 
 ### Saldo Final (regra anti-loop)
 
-Para cada coluna (Individual, Controladas, Consolidado), o **Saldo Final (L11)** é a
-**soma algébrica literal das células L3:L10** dessa mesma coluna (respeitando o sinal
+Para cada coluna (Individual, Controladas, Consolidado), o **Saldo Final (L9)** é a
+**soma algébrica literal das células L3:L8** dessa mesma coluna (respeitando o sinal
 exibido). **Não** é usada fórmula independente nem recomputação a partir do razão.
 
 ```
-Saldo Final (L11) = SOMA(L3:L10)   — por coluna
+Saldo Final (L9) = SOMA(L3:L8)   — por coluna
 ```
 
-- No `.xlsx`, a célula do Saldo Final usa **fórmula real** `=SUM(<L3>:<L10>)` por coluna.
-- **Validação que aborta**: após montar o resumo, recomputa em Python a soma de L3:L10
+- No `.xlsx`, a célula do Saldo Final usa **fórmula real** `=SUM(<L3>:<L8>)` por coluna.
+- **Validação que aborta**: após montar o resumo, recomputa em Python a soma de L3:L8
   por coluna e compara com o Saldo Final; se divergir em qualquer coluna (tolerância
-  0,5 milhar), a geração é **abortada com ERROR**. O LOG registra as 3 somas L3:L10 e
+  0,5 milhar), a geração é **abortada com ERROR**. O LOG registra as 3 somas L3:L8 e
   os 3 Saldos Finais.
+
+### Aba "Conciliação"
+
+O mesmo `.xlsx` inclui uma aba **"Conciliação"** que reconcilia a base classificada,
+o resumo e as eliminações, com as linhas:
+
+- Total da base classificada (soma de `Montante Razão` das linhas de movimento);
+- Total considerado no resumo (soma das linhas L4:L8);
+- Total eliminado no consolidado (soma das linhas `Consolida="S"`);
+- Diferença esperada;
+- Diferença apurada;
+- **Status**: `OK` ou `Divergência`.
+
+O status é registrado no LOG.
 
 ### Detalhe: aba "Classificado" (conteúdo integral)
 
@@ -328,7 +356,7 @@ resumir ou agrupar.
 - Cabeçalho verde com texto branco em negrito
 - Saldo Inicial e Saldo Final em negrito com destaque verde claro
 - IRRF e Baixas em vermelho
-- Valores em **milhares** (÷1000), sem decimais, separador de milhar BR; negativos em vermelho/parênteses
+- Valores em **milhares** (÷1000), sem decimais, separador de milhar BR; zero → `-`; negativos em vermelho/parênteses
 - Faixa laranja de separação antes do Saldo Final
 
 ---
@@ -341,10 +369,13 @@ Arquivo:
 
 Campos persistidos:
 
-- valor;
+- valor (input único: Individual = Consolidado; Controladas = 0);
 - período/trimestre;
 - data da última alteração;
 - usuário (`getpass.getuser()`).
+
+O **Saldo Inicial** (opção 7) é um **input único**: o valor informado vai para
+Individual E Consolidado; Controladas fica em 0.
 
 O script recupera automaticamente o último valor como padrão e mantém histórico simples (append).
 
