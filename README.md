@@ -19,7 +19,7 @@ Automação em Python para:
 ```
 1 - Extrair razão (FBL3N) + Consolidar
 2 - Classificar consolidado
-3 - Importar ZFIT009 / ZCO059
+3 - Importar ZFIT009 / ZCO059 + Balancete (F.01)
 4 - Gerar tabela de consolidação
 5 - Aplicar Status Consolidação na movimentação
 6 - Tratar contrapartidas (auditoria) + Excel classificado
@@ -247,7 +247,7 @@ Lógica do Consolida:
 
 ## Contrapartidas (auditoria)
 
-A opção 6 move, para auditoria, linhas com `Conta`:
+A opção 6 gera uma **cópia de auditoria** das linhas com `Conta`:
 
 - `4401020004` (Juros)
 - `1103050050` (IRRF)
@@ -255,8 +255,9 @@ A opção 6 move, para auditoria, linhas com `Conta`:
 
 Arquivos:
 
-- Principal (classificado) permanece sem essas linhas.
-- Auditoria: `Auditoria_Contrapartidas_<periodo>.csv`
+- **Principal (classificado) MANTÉM essas linhas** (IOF/IRRF/Juros permanecem
+  no Classificado — participam da reconciliação com o Balancete, issue #25 item 6).
+- Auditoria: `Auditoria_Contrapartidas_<periodo>.csv` (cópia dessas linhas como evidência).
 
 Também gera:
 
@@ -267,6 +268,61 @@ Também gera:
   - largura automática;
   - formato numérico contábil para `Montante Razão`;
   - destaque visual para totais/subtotais.
+
+---
+
+## Balancete (transação SAP F.01)
+
+A opção **3** também importa e concilia o **Balancete** (transação SAP `F.01`,
+variante `BPMUTDFC`, usuário `MS0000240`) contra o Razão (Classificado),
+gerando evidência de auditoria (issue #25).
+
+### Parâmetros dinâmicos por período
+
+Derivados automaticamente da data final do período (nome do `Classificado_*`):
+
+| Bloco | Campo SAP | Valor |
+|-------|-----------|-------|
+| Atual | `txtBILBJAHR` | ANO FINAL |
+| Atual | `txtB-MONATE-LOW` / `txtB-MONATE-HIGH` | MÊS FINAL |
+| Comparativo | `txtBILVJAHR` | ANO FINAL − 1 |
+| Comparativo | `txtV-MONATE-LOW` / `txtV-MONATE-HIGH` | `12` |
+
+> Ex.: período 01/04/2026–30/06/2026 → Atual 2026 / 06-06; Comparativo 2025 / 12-12.
+
+O arquivo é exportado para `saidas/tabelas/F.01.csv`.
+
+### Parser F.01
+
+- Ignora cabeçalhos repetidos por empresa/página e linhas de subtotal marcadas
+  na última coluna (`Rela`) com `*1*`, `*2*`, `*3*`, `*4*`.
+- Considera apenas linhas de detalhe (`Rela` vazio, `Empr`/`Div` preenchidos e
+  número de Conta no início do campo `Textos`).
+- Trata valores no formato BR com sinal `-` à direita (ex.: `10.229,02-`).
+- Extrai a evidência do topo do relatório: data e hora de emissão, usuário
+  executor, empresa, exercício e períodos consultados.
+
+### Aba "Balancete" no `.xlsx`
+
+- Bloco de **evidência** no topo (data/hora/usuário/empresa/exercício/período).
+- **Conferência global**: Total Variação no Período, Total Movimentação Razão,
+  Diferença e Status (`OK`/`DIVERGÊNCIA`), também registrados no LOG.
+- Tabela com colunas renomeadas (item 8):
+
+| Coluna | Origem |
+|--------|--------|
+| Saldo Período Atual | Períodos de relató |
+| Saldo Período Comparativo | Períodos de compar |
+| Variação no Período | Desvio absoluto |
+| Movimentação Razão | Σ `Montante Razão` do Classificado por Empr+Div+Conta |
+| Diferença de Conciliação | Variação no Período − Movimentação Razão |
+| Conferência | `OK` se \|Diferença\| ≤ 0,01; senão `DIVERGÊNCIA` |
+
+### Conciliação conta a conta
+
+Chave = `Empr` + `Div` + `Conta`. A **Movimentação Razão** é a soma de
+`Montante Razão` do Classificado agrupada por essa chave. Também é gerado o
+`Balancete_<periodo>.csv` (utf-8-sig) como evidência.
 
 ---
 
