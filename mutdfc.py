@@ -183,6 +183,49 @@ _ZCO059_SHELL = (
 )
 _ZCO059_DIVISAO_RE = re.compile(r"[A-Z0-9]{2,10}")
 
+# ---------------------------------------------------------------------------
+# BALANCETE (transação SAP F.01) — variante/usuário e IDs dos controles
+# (alinhados ao VBS F.01_ComVariante — não alterar sem novo VBS)
+# ---------------------------------------------------------------------------
+
+# Variante de layout da F.01 (campo txtV-LOW da tela de seleção de variante)
+F01_VARIANTE = "BPMUTDFC"
+
+# Usuário SAP responsável pela variante da F.01 (campo txtENAME-LOW)
+F01_USUARIO = "MS0000240"
+
+# Prefixo dos campos de período da tela de seleção da F.01 (RFBILA00)
+_F01_PREFIXO = (
+    "wnd[0]/usr/tabsTABSTRIP_TABBL1/tabpUCOM1/"
+    "ssub%_SUBSCREEN_TABBL1:RFBILA00:0001/"
+)
+
+# Nome do arquivo exportado pela F.01
+F01_ARQUIVO = "F.01.csv"
+
+# Tolerância (em reais) para a conciliação conta a conta do Balancete x Razão
+TOLERANCIA_CONCILIACAO = 0.01
+
+# Colunas renomeadas na aba Balancete (auditoria) — item 8 da issue #25
+BALANCETE_COLUNAS = [
+    "Empr",
+    "Div",
+    "Conta",
+    "Descrição",
+    "Saldo Período Atual",
+    "Saldo Período Comparativo",
+    "Variação no Período",
+    "Movimentação Razão",
+    "Diferença de Conciliação",
+    "Conferência",
+]
+
+# Marcadores de subtotal na última coluna (Rela) da F.01 — ignorados no parser
+_F01_SUBTOTAIS = {"*1*", "*2*", "*3*", "*4*"}
+
+# Regex para separar Conta (número) da Descrição no campo "Textos" da F.01
+_F01_CONTA_RE = re.compile(r"^\s*(\d+)\s+(.*)$")
+
 
 # ---------------------------------------------------------------------------
 # CONFIGURAÇÃO DO LOG
@@ -2068,7 +2111,9 @@ def separar_contrapartidas(
     logger: logging.Logger,
 ):
     """
-    Move linhas de contas de contrapartida para auditoria e remove do principal.
+    Gera uma CÓPIA de auditoria das linhas de contrapartida (IOF/IRRF/Juros),
+    mantendo-as também no arquivo principal (issue #25, item 6 — participam da
+    reconciliação com o Balancete).
     Ao escrever a saída final, remove as colunas em COLUNAS_REMOVER_SAIDA
     (St, Atribuição, Imobilizado, DiagRede) — item 5.
     """
@@ -2094,10 +2139,12 @@ def separar_contrapartidas(
             continue
         campos = parse_linha(linha)
         conta = campos[IDX_CONTA].strip() if len(campos) > IDX_CONTA else ""
+        # Issue #25 (item 6): IOF/IRRF/Juros PERMANECEM no Classificado (para
+        # participar da reconciliação com o Balancete). A auditoria recebe uma
+        # CÓPIA dessas linhas como evidência; o principal não é mais depurado.
+        linhas_principais.append(linha)
         if conta in CONTAS_CONTRAPARTIDA_AUDITORIA:
             linhas_auditoria.append(linha)
-        else:
-            linhas_principais.append(linha)
 
     def _aplicar_remocao(linha_raw):
         """Remove colunas pelos índices calculados do cabeçalho."""
@@ -2138,12 +2185,13 @@ def separar_contrapartidas(
         if i in indices_remover and p.strip()
     )
     logger.info(
-        "Contrapartidas separadas: %d linha(s) para auditoria em '%s'.",
+        "Contrapartidas copiadas para auditoria (mantidas no principal): "
+        "%d linha(s) em '%s'.",
         len(linhas_auditoria),
         caminho_auditoria,
     )
     logger.info(
-        "Arquivo principal atualizado sem contrapartidas: %d linha(s) em '%s'.",
+        "Arquivo principal (IOF/IRRF/Juros mantidos): %d linha(s) em '%s'.",
         len(linhas_principais),
         caminho_principal,
     )
@@ -3412,6 +3460,560 @@ def selecionar_arquivo_entrada(
 
 
 # ---------------------------------------------------------------------------
+# BALANCETE (transação SAP F.01) — import dinâmico, parser e conciliação
+# ---------------------------------------------------------------------------
+
+def _calcular_parametros_f01(data_final: datetime) -> dict:
+    """
+    Deriva os parâmetros dinâmicos da F.01 a partir do período do sistema.
+
+    Regra (issue #25):
+      - Período ATUAL:      ano = ANO FINAL; mês (low/high) = MÊS FINAL.
+      - Período COMPARATIVO: ano = ANO FINAL - 1; mês (low/high) = "12".
+
+    Ex.: período 01/04/2026–30/06/2026 -> Atual 2026 / 06-06 ;
+         Comparativo 2025 / 12-12.
+
+    Retorna dicionário com as chaves usadas pelos campos da tela RFBILA00.
+    """
+    ano_atual = data_final.year
+    mes_final = f"{data_final.month:02d}"
+    return {
+        "BILBJAHR": str(ano_atual),        # ano final (período atual)
+        "B_MONATE_LOW": mes_final,          # mês final
+        "B_MONATE_HIGH": mes_final,         # mês final
+        "BILVJAHR": str(ano_atual - 1),     # ano final - 1 (comparativo)
+        "V_MONATE_LOW": "12",               # comparativo sempre 12
+        "V_MONATE_HIGH": "12",              # comparativo sempre 12
+    }
+
+
+def _data_final_do_classificado(arquivo: str, logger: logging.Logger) -> datetime:
+    """Extrai a data final (datetime) do nome de um arquivo Classificado_*."""
+    _, fim = _extrair_datas_do_nome(os.path.basename(arquivo or ""))
+    try:
+        return datetime.strptime(fim, "%d.%m.%Y")
+    except ValueError:
+        logger.warning(
+            "Não foi possível extrair data final de '%s'; usando data atual.",
+            arquivo,
+        )
+        return datetime.now()
+
+
+def parse_f01(caminho: str, logger: logging.Logger) -> tuple:
+    """
+    Parser do Balancete exportado pela F.01 (formato SAP RFBILA00).
+
+    - Ignora cabeçalhos repetidos por empresa/página e linhas de subtotal
+      marcadas na última coluna (Rela) com *1*, *2*, *3* ou *4*.
+    - Considera apenas linhas de detalhe (Rela vazio, Empr/Div preenchidos e
+      número de Conta no início do campo "Textos").
+    - Trata valores no formato BR com sinal '-' à direita (ex.: 10.229,02-).
+    - Extrai também a evidência do topo do relatório (data/hora de emissão,
+      usuário executor, empresa, exercício e períodos consultados).
+
+    Retorna (evidencia: dict, linhas: list[dict]).
+    Cada linha: empr, div, conta, descricao, saldo_atual, saldo_comparativo,
+    variacao (Desvio absoluto = atual - comparativo).
+    """
+    evidencia = {
+        "data_emissao": "",
+        "hora_emissao": "",
+        "usuario": "",
+        "empresa": "",
+        "exercicio": "",
+        "periodo_atual": "",
+        "periodo_comparativo": "",
+    }
+    linhas = []
+
+    if not os.path.isfile(caminho):
+        logger.error("Arquivo F.01 (Balancete) não encontrado: '%s'", caminho)
+        return evidencia, linhas
+
+    conteudo = ler_csv_corrigindo_encoding(caminho, logger)
+
+    re_datahora = re.compile(r"Tmp\.\s*([\d:]+).*?Data\s+([\d.]+)")
+    re_usuario = re.compile(r"RFBILA00/(\S+)")
+    re_empresa = re.compile(r"(BALAN[ÇC]O.*?)\s{2,}Tmp\.")
+    re_periodo = re.compile(r"\((\d{4})\.(\d{2})-(\d{4})\.(\d{2})\)")
+
+    ignoradas_subtotal = 0
+    ignoradas_cabecalho = 0
+
+    for linha in conteudo:
+        # ---- Evidência (capturada na primeira ocorrência) ----
+        if not evidencia["data_emissao"]:
+            m = re_datahora.search(linha)
+            if m:
+                evidencia["hora_emissao"] = m.group(1).strip()
+                evidencia["data_emissao"] = m.group(2).strip()
+        if not evidencia["usuario"]:
+            m = re_usuario.search(linha)
+            if m:
+                evidencia["usuario"] = m.group(1).strip()
+        if not evidencia["empresa"]:
+            m = re_empresa.search(linha)
+            if m:
+                evidencia["empresa"] = m.group(1).strip()
+        if not evidencia["periodo_atual"]:
+            achados = re_periodo.findall(linha)
+            if len(achados) >= 2:
+                a1, m1, a2, m2 = achados[0]
+                b1, n1, b2, n2 = achados[1]
+                evidencia["periodo_atual"] = f"{a1}.{m1} a {a2}.{m2}"
+                evidencia["periodo_comparativo"] = f"{b1}.{n1} a {b2}.{n2}"
+                evidencia["exercicio"] = a2
+
+        # ---- Linhas de detalhe ----
+        if not linha.startswith("|"):
+            continue
+        partes = linha.split("|")
+        if len(partes) < 10:
+            continue
+        # partes[1]=S, [2]=Empr, [3]=Div, [4]=Textos, [5]=relató,
+        # [6]=compar, [7]=Desvio absoluto, [8]=DesvRel, [9]=Rela
+        rela = partes[9].strip()
+        empr = partes[2].strip()
+        div = partes[3].strip()
+        textos = partes[4].strip()
+
+        if rela in _F01_SUBTOTAIS:
+            ignoradas_subtotal += 1
+            continue
+        if not empr or not div:
+            continue
+        m_conta = _F01_CONTA_RE.match(textos)
+        if not m_conta:
+            ignoradas_cabecalho += 1
+            continue
+
+        conta = m_conta.group(1).strip()
+        descricao = m_conta.group(2).strip()
+        saldo_atual = _parse_montante(partes[5]) or 0.0
+        saldo_comparativo = _parse_montante(partes[6]) or 0.0
+        variacao = _parse_montante(partes[7])
+        if variacao is None:
+            variacao = saldo_atual - saldo_comparativo
+
+        linhas.append(
+            {
+                "empr": empr,
+                "div": div,
+                "conta": conta,
+                "descricao": descricao,
+                "saldo_atual": saldo_atual,
+                "saldo_comparativo": saldo_comparativo,
+                "variacao": variacao,
+            }
+        )
+
+    logger.info(
+        "F.01 parseada: %d linha(s) de detalhe | subtotais ignorados=%d | "
+        "cabeçalhos ignorados=%d.",
+        len(linhas), ignoradas_subtotal, ignoradas_cabecalho,
+    )
+    logger.info(
+        "F.01 evidência: emissão %s %s | usuário=%s | empresa='%s' | "
+        "exercício=%s | atual=(%s) | comparativo=(%s).",
+        evidencia["data_emissao"], evidencia["hora_emissao"],
+        evidencia["usuario"], evidencia["empresa"], evidencia["exercicio"],
+        evidencia["periodo_atual"], evidencia["periodo_comparativo"],
+    )
+    return evidencia, linhas
+
+
+def _movimentacao_razao_por_conta(
+    arquivo_classificado: str, logger: logging.Logger
+) -> dict:
+    """
+    Soma "Montante Razão" do Classificado agrupado por (Empr, Div, Conta).
+
+    Usado como "Movimentação Razão" na conciliação conta a conta do Balancete.
+    Retorna dict[(empr, div, conta)] -> float.
+    """
+    mov = defaultdict(float)
+    if not arquivo_classificado or not os.path.isfile(arquivo_classificado):
+        logger.warning(
+            "Classificado não disponível para conciliação do Balancete: '%s'.",
+            arquivo_classificado,
+        )
+        return mov
+
+    idx_empr, idx_div = IDX_EMPR, IDX_DIV
+    idx_conta, idx_montante = IDX_CONTA, IDX_MONTANTE
+
+    for linha in ler_csv_corrigindo_encoding(arquivo_classificado, logger):
+        tp = tipo_de_linha(linha)
+        if tp == "cabecalho":
+            campos = parse_linha(linha)
+            for i, c in enumerate(campos):
+                cn = c.strip().lower()
+                if cn == "empr":
+                    idx_empr = i
+                elif cn == "div":
+                    idx_div = i
+                elif cn == "conta":
+                    idx_conta = i
+                elif "montante" in cn:
+                    idx_montante = i
+            continue
+        if tp != "dado":
+            continue
+        campos = parse_linha(linha)
+        empr = campos[idx_empr].strip() if len(campos) > idx_empr else ""
+        div = campos[idx_div].strip() if len(campos) > idx_div else ""
+        conta = campos[idx_conta].strip() if len(campos) > idx_conta else ""
+        montante = _parse_montante(campos[idx_montante]) if len(campos) > idx_montante else 0.0
+        mov[(empr, div, conta)] += montante or 0.0
+
+    logger.info(
+        "Movimentação Razão agregada por Empr+Div+Conta: %d chave(s).", len(mov)
+    )
+    return mov
+
+
+def conciliar_balancete(
+    linhas: list, mov_razao: dict, tolerancia: float = TOLERANCIA_CONCILIACAO
+) -> tuple:
+    """
+    Concilia cada linha do Balancete com a Movimentação Razão (por Empr+Div+Conta).
+
+    Para cada linha adiciona:
+      - mov_razao: soma do Montante Razão da chave (Empr, Div, Conta)
+      - diferenca: Variação no Período - Movimentação Razão
+      - conferencia: "OK" se |diferenca| <= tolerância; senão "DIVERGÊNCIA".
+
+    Retorna (linhas, totais). totais possui total_variacao, total_mov_razao,
+    diferenca e status (conferência global).
+    """
+    total_var = 0.0
+    total_mov = 0.0
+    for l in linhas:
+        chave = (l["empr"], l["div"], l["conta"])
+        mov = mov_razao.get(chave, 0.0)
+        var = l.get("variacao") or 0.0
+        dif = var - mov
+        l["mov_razao"] = mov
+        l["diferenca"] = dif
+        l["conferencia"] = "OK" if abs(dif) <= tolerancia else "DIVERGÊNCIA"
+        total_var += var
+        total_mov += mov
+
+    diferenca_global = total_var - total_mov
+    status = "OK" if abs(diferenca_global) <= tolerancia else "DIVERGÊNCIA"
+    totais = {
+        "total_variacao": total_var,
+        "total_mov_razao": total_mov,
+        "diferenca": diferenca_global,
+        "status": status,
+    }
+    return linhas, totais
+
+
+def exportar_balancete(
+    evidencia: dict,
+    linhas: list,
+    totais: dict,
+    pasta_saida: str,
+    periodo_nome: str,
+    logger: logging.Logger,
+) -> tuple:
+    """
+    Gera o Balancete conciliado em CSV (utf-8-sig) e .xlsx (aba "Balancete").
+
+    O .xlsx contém, no topo, o bloco de EVIDÊNCIA (data/hora/usuário/empresa/
+    exercício/período), a CONFERÊNCIA GLOBAL e a tabela com as colunas
+    renomeadas (item 8). Retorna (caminho_csv, caminho_xlsx).
+    """
+    os.makedirs(pasta_saida, exist_ok=True)
+    base = f"Balancete_{periodo_nome}"
+    caminho_csv = os.path.join(pasta_saida, base + ".csv")
+
+    evid_linhas = [
+        ("Data emissão", evidencia.get("data_emissao", "")),
+        ("Hora emissão", evidencia.get("hora_emissao", "")),
+        ("Usuário", evidencia.get("usuario", "")),
+        ("Empresa", evidencia.get("empresa", "")),
+        ("Exercício", evidencia.get("exercicio", "")),
+        ("Período consultado", evidencia.get("periodo_atual", "")),
+        ("Período comparativo", evidencia.get("periodo_comparativo", "")),
+    ]
+
+    # ---- CSV (utf-8-sig, delimitado por '|') ----
+    with open(caminho_csv, "w", encoding="utf-8-sig", newline="") as f:
+        f.write("EVIDÊNCIA DE AUDITORIA — BALANCETE (F.01)\n")
+        for rotulo, valor in evid_linhas:
+            f.write(f"{rotulo}|{valor}\n")
+        f.write("\n")
+        f.write("CONFERÊNCIA GLOBAL\n")
+        f.write(f"Total Variação no Período|{_formatar_valor_br(totais['total_variacao'])}\n")
+        f.write(f"Total Movimentação Razão|{_formatar_valor_br(totais['total_mov_razao'])}\n")
+        f.write(f"Diferença|{_formatar_valor_br(totais['diferenca'])}\n")
+        f.write(f"Status|{totais['status']}\n")
+        f.write("\n")
+        f.write("|".join(BALANCETE_COLUNAS) + "\n")
+        for l in linhas:
+            f.write(
+                "|".join(
+                    [
+                        l["empr"],
+                        l["div"],
+                        l["conta"],
+                        l["descricao"],
+                        _formatar_valor_br(l["saldo_atual"]),
+                        _formatar_valor_br(l["saldo_comparativo"]),
+                        _formatar_valor_br(l["variacao"]),
+                        _formatar_valor_br(l.get("mov_razao", 0.0)),
+                        _formatar_valor_br(l.get("diferenca", 0.0)),
+                        l.get("conferencia", ""),
+                    ]
+                )
+                + "\n"
+            )
+
+    caminho_xlsx = _exportar_balancete_xlsx(
+        evid_linhas, linhas, totais, os.path.splitext(caminho_csv)[0] + ".xlsx", logger
+    )
+
+    logger.info("Balancete gerado: '%s'%s.", caminho_csv,
+                f" e '{caminho_xlsx}'" if caminho_xlsx else "")
+    return caminho_csv, caminho_xlsx
+
+
+def _exportar_balancete_xlsx(
+    evid_linhas: list, linhas: list, totais: dict, caminho_xlsx: str,
+    logger: logging.Logger,
+):
+    """Gera a aba "Balancete" formatada. Retorna o caminho ou None."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError:
+        logger.error("openpyxl não instalado. Execute: pip install openpyxl")
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Balancete"
+
+    titulo_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    bloco_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    ok_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    div_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    fmt_num = '#,##0.00_);[Red](#,##0.00)'
+
+    r = 1
+    cel = ws.cell(row=r, column=1, value="EVIDÊNCIA DE AUDITORIA — BALANCETE (F.01)")
+    cel.font = Font(bold=True, color="FFFFFF")
+    cel.fill = titulo_fill
+    r += 1
+    for rotulo, valor in evid_linhas:
+        ws.cell(row=r, column=1, value=rotulo).font = Font(bold=True)
+        ws.cell(row=r, column=2, value=valor)
+        r += 1
+
+    r += 1
+    cel = ws.cell(row=r, column=1, value="CONFERÊNCIA GLOBAL")
+    cel.font = Font(bold=True, color="FFFFFF")
+    cel.fill = titulo_fill
+    r += 1
+    conf = [
+        ("Total Variação no Período", totais["total_variacao"], True),
+        ("Total Movimentação Razão", totais["total_mov_razao"], True),
+        ("Diferença", totais["diferenca"], True),
+        ("Status", totais["status"], False),
+    ]
+    for rotulo, valor, numerico in conf:
+        ws.cell(row=r, column=1, value=rotulo).font = Font(bold=True)
+        c = ws.cell(row=r, column=2, value=valor)
+        if numerico:
+            c.number_format = fmt_num
+            c.alignment = Alignment(horizontal="right")
+        else:
+            c.fill = ok_fill if valor == "OK" else div_fill
+            c.font = Font(bold=True)
+        r += 1
+
+    r += 1
+    linha_cabecalho = r
+    for col, titulo in enumerate(BALANCETE_COLUNAS, start=1):
+        cel = ws.cell(row=r, column=col, value=titulo)
+        cel.font = Font(bold=True, color="FFFFFF")
+        cel.fill = titulo_fill
+        cel.alignment = Alignment(horizontal="center", vertical="center")
+    r += 1
+
+    cols_numericas = {5, 6, 7, 8, 9}  # colunas de valor (1-based)
+    for l in linhas:
+        valores = [
+            l["empr"], l["div"], l["conta"], l["descricao"],
+            l["saldo_atual"], l["saldo_comparativo"], l["variacao"],
+            l.get("mov_razao", 0.0), l.get("diferenca", 0.0),
+            l.get("conferencia", ""),
+        ]
+        for col, valor in enumerate(valores, start=1):
+            c = ws.cell(row=r, column=col, value=valor)
+            if col in cols_numericas:
+                c.number_format = fmt_num
+                c.alignment = Alignment(horizontal="right")
+        conf_cell = ws.cell(row=r, column=10)
+        conf_cell.fill = ok_fill if l.get("conferencia") == "OK" else div_fill
+        r += 1
+
+    ws.freeze_panes = ws.cell(row=linha_cabecalho + 1, column=1).coordinate
+    if linhas:
+        ws.auto_filter.ref = (
+            f"A{linha_cabecalho}:"
+            f"{ws.cell(row=linha_cabecalho, column=len(BALANCETE_COLUNAS)).column_letter}"
+            f"{r - 1}"
+        )
+
+    for col in ws.columns:
+        comprimento = max(len(str(c.value or "")) for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(comprimento + 2, 80)
+
+    try:
+        wb.save(caminho_xlsx)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Falha ao salvar Balancete .xlsx '%s': %s", caminho_xlsx, exc)
+        return None
+    return caminho_xlsx
+
+
+def gerar_balancete(
+    arquivo_f01: str,
+    arquivo_classificado: str,
+    pasta_saida: str,
+    logger: logging.Logger,
+):
+    """
+    Orquestra o tratamento do Balancete: parseia a F.01, concilia conta a conta
+    com o Razão (Classificado) por Empr+Div+Conta e gera CSV + aba "Balancete".
+
+    Retorna o caminho do .xlsx (ou do CSV) gerado, ou None em caso de falha.
+    """
+    if not arquivo_f01 or not os.path.isfile(arquivo_f01):
+        logger.error("Arquivo F.01 inexistente para gerar Balancete: '%s'.", arquivo_f01)
+        return None
+
+    evidencia, linhas = parse_f01(arquivo_f01, logger)
+    if not linhas:
+        logger.error("F.01 sem linhas de detalhe; Balancete não gerado.")
+        return None
+
+    mov_razao = _movimentacao_razao_por_conta(arquivo_classificado, logger)
+    linhas, totais = conciliar_balancete(linhas, mov_razao)
+
+    logger.info(
+        "CONCILIAÇÃO BALANCETE -> Total Variação=%s | Total Razão=%s | "
+        "Diferença=%s | Status=%s",
+        _formatar_valor_br(totais["total_variacao"]),
+        _formatar_valor_br(totais["total_mov_razao"]),
+        _formatar_valor_br(totais["diferenca"]),
+        totais["status"],
+    )
+
+    if arquivo_classificado:
+        data_ini, data_fim = _extrair_datas_do_nome(os.path.basename(arquivo_classificado))
+        periodo_nome = f"{data_ini}_a_{data_fim}"
+    else:
+        periodo_nome = datetime.now().strftime("%d.%m.%Y")
+
+    caminho_csv, caminho_xlsx = exportar_balancete(
+        evidencia, linhas, totais, pasta_saida, periodo_nome, logger
+    )
+    return caminho_xlsx or caminho_csv
+
+
+def importar_f01_sap(session, params: dict, pasta_tabelas: str, logger: logging.Logger):
+    """
+    Importa o Balancete via SAP GUI Scripting (transação F.01), seguindo o VBS
+    gravado (variante BPMUTDFC, usuário MS0000240) com PARÂMETROS DINÂMICOS de
+    período. Salva em saidas/tabelas/F.01.csv.
+
+    Fluxo alinhado ao VBS:
+      maximize → f.01 → sendVKey 0 → sendVKey 17 (variante) →
+      txtV-LOW/txtENAME-LOW → sendVKey 0 → BILBJAHR/B-MONATE/BILVJAHR/V-MONATE →
+      sendVKey 8 (F8) → menu[0]/menu[1]/menu[2] (exportar arquivo local) →
+      sendVKey 0 → DY_PATH/DY_FILENAME → btn[11] → 2× sendVKey 3
+    """
+    os.makedirs(pasta_tabelas, exist_ok=True)
+    caminho = os.path.join(pasta_tabelas, F01_ARQUIVO)
+
+    # Passo 1 — Abrir F.01 e a seleção de variante
+    try:
+        logger.info("F.01 SAP [1/5]: abrindo transação e seleção de variante.")
+        session.findById("wnd[0]").maximize()
+        session.findById("wnd[0]/tbar[0]/okcd").Text = "f.01"
+        session.findById("wnd[0]").sendVKey(0)
+        session.findById("wnd[0]").sendVKey(17)
+        esperar_controle(session, "wnd[1]/usr/txtV-LOW", logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("F.01 SAP [1/5 - abrir]: id=wnd[0]/tbar[0]/okcd | %s", exc)
+        return None
+
+    # Passo 2 — Preencher variante e usuário
+    try:
+        logger.info("F.01 SAP [2/5]: variante '%s' / usuário '%s'.", F01_VARIANTE, F01_USUARIO)
+        session.findById("wnd[1]/usr/txtV-LOW").Text = F01_VARIANTE
+        session.findById("wnd[1]/usr/txtENAME-LOW").Text = F01_USUARIO
+        session.findById("wnd[1]/usr/txtENAME-LOW").setFocus()
+        session.findById("wnd[1]").sendVKey(0)
+        esperar_controle(session, _F01_PREFIXO + "txtBILBJAHR", logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("F.01 SAP [2/5 - variante]: id=wnd[1]/usr/txtV-LOW | %s", exc)
+        return None
+
+    # Passo 3 — Preencher parâmetros de período (dinâmicos) e executar (F8)
+    try:
+        logger.info(
+            "F.01 SAP [3/5]: período atual %s/%s-%s | comparativo %s/%s-%s.",
+            params["BILBJAHR"], params["B_MONATE_LOW"], params["B_MONATE_HIGH"],
+            params["BILVJAHR"], params["V_MONATE_LOW"], params["V_MONATE_HIGH"],
+        )
+        session.findById(_F01_PREFIXO + "txtBILBJAHR").Text = params["BILBJAHR"]
+        session.findById(_F01_PREFIXO + "txtB-MONATE-LOW").Text = params["B_MONATE_LOW"]
+        session.findById(_F01_PREFIXO + "txtB-MONATE-HIGH").Text = params["B_MONATE_HIGH"]
+        session.findById(_F01_PREFIXO + "txtBILVJAHR").Text = params["BILVJAHR"]
+        session.findById(_F01_PREFIXO + "txtV-MONATE-LOW").Text = params["V_MONATE_LOW"]
+        session.findById(_F01_PREFIXO + "txtV-MONATE-HIGH").Text = params["V_MONATE_HIGH"]
+        session.findById(_F01_PREFIXO + "txtV-MONATE-HIGH").setFocus()
+        session.findById("wnd[0]").sendVKey(8)
+        time.sleep(2)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("F.01 SAP [3/5 - período/F8]: id=%stxtBILBJAHR | %s", _F01_PREFIXO, exc)
+        return None
+
+    # Passo 4 — Exportar arquivo local (menu[0]/menu[1]/menu[2]) e salvar
+    try:
+        logger.info("F.01 SAP [4/5]: exportando arquivo local (menu[0]/menu[1]/menu[2]).")
+        session.findById("wnd[0]/mbar/menu[0]/menu[1]/menu[2]").select()
+        esperar_controle(session, "wnd[1]", logger=logger)
+        session.findById("wnd[1]").sendVKey(0)
+        esperar_controle(session, "wnd[1]/usr/ctxtDY_PATH", logger=logger)
+        session.findById("wnd[1]/usr/ctxtDY_PATH").Text = pasta_tabelas
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").Text = F01_ARQUIVO
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = len(F01_ARQUIVO)
+        session.findById("wnd[1]/tbar[0]/btn[11]").press()
+        logger.info("F.01 SAP: arquivo exportado para '%s'.", caminho)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("F.01 SAP [4/5 - salvar]: id=wnd[1]/usr/ctxtDY_PATH | %s", exc)
+        return None
+
+    # Passo 5 — Fechar telas (2× sendVKey 3 = Voltar)
+    try:
+        logger.info("F.01 SAP [5/5]: fechando telas (2× sendVKey 3).")
+        session.findById("wnd[0]").sendVKey(3)
+        session.findById("wnd[0]").sendVKey(3)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("F.01 SAP [5/5 - fechar telas]: %s", exc)
+
+    return caminho if os.path.isfile(caminho) else caminho
+
+
+# ---------------------------------------------------------------------------
 # AÇÕES DO MENU
 # ---------------------------------------------------------------------------
 
@@ -3530,6 +4132,46 @@ def _executar_importar_tabelas(logger: logging.Logger, caminho_log: str) -> None
         print(f"  ZCO059 : {zco}")
     else:
         print("  Falha na importação de tabelas (verifique o LOG).")
+    print(f"  LOG: {caminho_log}")
+    print("=" * 60)
+
+    # -----------------------------------------------------------------------
+    # BALANCETE (F.01) — extração dinâmica + conciliação com o Razão.
+    # Incorporado a esta opção (issue #25): o Balancete complementa a
+    # importação de tabelas e é conciliado conta a conta com o Classificado.
+    # -----------------------------------------------------------------------
+    incluir = (input("\nImportar e conciliar Balancete (F.01)? [S/n]: ").strip().lower() or "s")
+    if not incluir.startswith("s"):
+        return
+
+    arq_classificado = selecionar_arquivo_entrada(
+        "Arquivo classificado (Razão) para conciliar o Balancete",
+        "Classificado_*.csv",
+        PASTA_CONSOLIDADO,
+        logger,
+    )
+
+    if origem == "1":
+        data_final = _data_final_do_classificado(arq_classificado, logger)
+        params = _calcular_parametros_f01(data_final)
+        logger.info("F.01 parâmetros dinâmicos (data final %s): %s",
+                    data_final.strftime("%d.%m.%Y"), params)
+        arq_f01 = importar_f01_sap(session, params, PASTA_TABELAS, logger)
+    else:
+        arq_f01 = selecionar_arquivo_entrada(
+            "Arquivo F.01 (Balancete) exportado manualmente",
+            "F.01*.csv",
+            PASTA_TABELAS,
+            logger,
+        )
+
+    balancete = gerar_balancete(arq_f01, arq_classificado, PASTA_CONSOLIDADO, logger) if arq_f01 else None
+
+    print("\n" + "=" * 60)
+    if balancete:
+        print(f"  Balancete: {balancete}")
+    else:
+        print("  Falha ao gerar Balancete (verifique o LOG).")
     print(f"  LOG: {caminho_log}")
     print("=" * 60)
 
@@ -3758,6 +4400,20 @@ def _executar_tudo(logger: logging.Logger, caminho_log: str) -> None:
     xlsx_classificado = exportar_excel_corporativo(classificado_final, logger)
     resumo = gerar_resumo_fluxo(classificado_final, PASTA_CONSOLIDADO, logger)
 
+    # Balancete (F.01): extração dinâmica + conciliação com o Razão (issue #25).
+    balancete = None
+    try:
+        params_f01 = _calcular_parametros_f01(data_final)
+        logger.info("F.01 parâmetros dinâmicos (data final %s): %s",
+                    data_final.strftime("%d.%m.%Y"), params_f01)
+        arq_f01 = importar_f01_sap(session, params_f01, PASTA_TABELAS, logger)
+        if arq_f01:
+            balancete = gerar_balancete(
+                arq_f01, classificado_final, PASTA_CONSOLIDADO, logger
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Balancete (F.01) não gerado no fluxo completo: %s", exc)
+
     print("\n" + "=" * 60)
     print(f"  Consolidado  : {consolidado}")
     print(f"  Classificado : {classificado_final}")
@@ -3767,6 +4423,8 @@ def _executar_tudo(logger: logging.Logger, caminho_log: str) -> None:
         print(f"  Excel Class. : {xlsx_classificado}")
     if resumo:
         print(f"  Resumo       : {resumo}")
+    if balancete:
+        print(f"  Balancete    : {balancete}")
     print(f"  LOG          : {caminho_log}")
     print("=" * 60)
 
@@ -3784,7 +4442,7 @@ def mostrar_menu_principal() -> str:
     print("=" * 60)
     print("  1 - Extrair razão (FBL3N) + Consolidar")
     print("  2 - Classificar consolidado")
-    print("  3 - Importar ZFIT009 / ZCO059")
+    print("  3 - Importar ZFIT009 / ZCO059 + Balancete (F.01)")
     print("  4 - Gerar tabela de consolidação")
     print("  5 - Aplicar Status Consolidação na movimentação")
     print("  6 - Tratar contrapartidas (auditoria) + Excel classificado")
