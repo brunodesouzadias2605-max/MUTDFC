@@ -279,16 +279,23 @@ gerando evidência de auditoria (issue #25).
 
 ### Parâmetros dinâmicos por período
 
-Derivados automaticamente da data final do período (nome do `Classificado_*`):
+Derivados automaticamente da data final do período (nome do `Classificado_*`).
+O comparativo mede a movimentação de **um mês** (mês final − mês imediatamente
+anterior), reconciliando com a Movimentação do Razão do mesmo mês:
 
 | Bloco | Campo SAP | Valor |
 |-------|-----------|-------|
-| Atual | `txtBILBJAHR` | ANO FINAL |
+| Atual | `txtBILBJAHR` | ANO DO MÊS FINAL |
 | Atual | `txtB-MONATE-LOW` / `txtB-MONATE-HIGH` | MÊS FINAL |
-| Comparativo | `txtBILVJAHR` | ANO FINAL − 1 |
-| Comparativo | `txtV-MONATE-LOW` / `txtV-MONATE-HIGH` | `12` |
+| Comparativo | `txtBILVJAHR` | ANO DO MÊS ANTERIOR |
+| Comparativo | `txtV-MONATE-LOW` / `txtV-MONATE-HIGH` | MÊS IMEDIATAMENTE ANTERIOR |
 
-> Ex.: período 01/04/2026–30/06/2026 → Atual 2026 / 06-06; Comparativo 2025 / 12-12.
+> Regra geral: mês final `M/AAAA` → comparativo `(M-1)/AAAA`.
+> Borda janeiro: mês final `01/AAAA` → comparativo `12/(AAAA-1)`.
+>
+> Ex.: período 01/03/2026–31/03/2026 → Atual 2026 / 03-03; Comparativo 2026 / 02-02.
+> Ex.: período 01/04/2026–30/06/2026 → Atual 2026 / 06-06; Comparativo 2026 / 05-05.
+> Ex.: período 01/01/2026–31/01/2026 → Atual 2026 / 01-01; Comparativo 2025 / 12-12.
 
 O arquivo é exportado para `saidas/tabelas/F.01.csv`.
 
@@ -303,6 +310,10 @@ O arquivo é exportado para `saidas/tabelas/F.01.csv`.
   executor, empresa, exercício e períodos consultados.
 
 ### Aba "Balancete" no `.xlsx`
+
+O Balancete conciliado é gerado como **arquivo separado** (`Balancete_<periodo>.xlsx`/`.csv`)
+**e também** como uma aba **"Balancete"** embutida no `Resumo_<periodo>.xlsx` (ver
+"Resumo de fluxo"). Ambos têm o mesmo conteúdo:
 
 - Bloco de **evidência** no topo (data/hora/usuário/empresa/exercício/período).
 - **Conferência global**: Total Variação no Período, Total Movimentação Razão,
@@ -331,7 +342,10 @@ Chave = `Empr` + `Div` + `Conta`. A **Movimentação Razão** é a soma de
 Opção 8 gera:
 
 - `Resumo_<periodo>.csv`
-- `Resumo_<periodo>.xlsx`
+- `Resumo_<periodo>.xlsx` — com as abas **Resumo**, **Conciliação**,
+  **Classificado** e **Balancete**. A aba **Balancete** é incluída quando a F.01
+  (`saidas/tabelas/F.01.csv`) estiver disponível, com o mesmo conteúdo do arquivo
+  `Balancete_<periodo>.xlsx` separado.
 
 ### Estrutura (linhas de planilha; L1 = título, L2 = cabeçalho)
 
@@ -406,6 +420,17 @@ Resumo inclui uma aba **"Classificado"** com o **conteúdo integral** do arquivo
 `Classificado_<periodo>` (razão final classificado — todas as linhas e colunas,
 incluindo `Classificação`, `Destino`, `Consolida` e `Estrutura de Consolidação`), sem
 resumir ou agrupar.
+
+### Aba "Balancete"
+
+O mesmo `.xlsx` do Resumo inclui uma aba **"Balancete"** com a conciliação conta a
+conta contra a F.01 (bloco de evidência, conferência global e a tabela
+`Empr|Div|Conta|Descrição|Saldo Período Atual|Saldo Período Comparativo|Variação no
+Período|Movimentação Razão|Diferença de Conciliação|Conferência`), com a mesma
+formatação do arquivo `Balancete_<periodo>.xlsx`. A aba é incluída quando a F.01
+(`saidas/tabelas/F.01.csv`) estiver presente; caso contrário, o Resumo é gerado com
+as três abas restantes. O LOG registra a conciliação da aba (Total Variação | Total
+Razão | Diferença | Status).
 
 ### Formatação corporativa do Resumo .xlsx
 
