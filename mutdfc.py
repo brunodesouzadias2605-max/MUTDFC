@@ -2819,6 +2819,29 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
             f.write(f"{descr}|{_formatar_valor_milhares(ind)}|{_formatar_valor_milhares(ctrl)}|{_formatar_valor_milhares(cons)}\n")
 
     # --------------------------------------------------
+    # BALANCETE (F.01) — dados para a aba "Balancete" embutida no Resumo_.xlsx
+    # (issue #27). Se a F.01 tiver sido exportada (saidas/tabelas/F.01.csv),
+    # parseia e concilia conta a conta com o Razão para incluir a aba.
+    # --------------------------------------------------
+    arquivo_f01 = os.path.join(PASTA_TABELAS, F01_ARQUIVO)
+    balancete_aba = preparar_dados_balancete(arquivo_f01, arquivo_classificado, logger)
+    if balancete_aba is not None:
+        _, _, totais_bal = balancete_aba
+        logger.info(
+            "Aba Balancete no Resumo -> Total Variação=%s | Total Razão=%s | "
+            "Diferença=%s | Status=%s",
+            _formatar_valor_br(totais_bal["total_variacao"]),
+            _formatar_valor_br(totais_bal["total_mov_razao"]),
+            _formatar_valor_br(totais_bal["diferenca"]),
+            totais_bal["status"],
+        )
+    else:
+        logger.info(
+            "Aba Balancete não incluída no Resumo (F.01 ausente ou sem detalhe): '%s'.",
+            arquivo_f01,
+        )
+
+    # --------------------------------------------------
     # EXPORTAR EXCEL com formatação profissional
     # --------------------------------------------------
     caminho_xlsx = os.path.join(pasta_saida, f"Resumo_{data_ini_str}_a_{data_fim_str}.xlsx")
@@ -2829,6 +2852,7 @@ def gerar_resumo_fluxo(arquivo_classificado: str, pasta_saida: str, logger: logg
         arquivo_classificado,
         conciliacao,
         logger,
+        balancete_aba,
     )
 
     # --------------------------------------------------
@@ -2858,6 +2882,7 @@ def exportar_resumo_fluxo_xlsx(
     arquivo_classificado: str,
     conciliacao: dict,
     logger: logging.Logger,
+    balancete_aba: tuple = None,
 ):
     """
     Exporta resumo de fluxo para Excel com formatação profissional para auditoria.
@@ -2879,6 +2904,8 @@ def exportar_resumo_fluxo_xlsx(
     - "Resumo": resumo executivo (L3:L8 + Saldo Final)
     - "Conciliação": reconciliação base classificada x resumo x eliminações
     - "Classificado": conteúdo integral do arquivo Classificado_ (razão final)
+    - "Balancete": conciliação conta a conta com a F.01 (issue #27), incluída
+      quando `balancete_aba` (evid_linhas, linhas, totais) for fornecida.
     """
     try:
         import openpyxl
@@ -3068,12 +3095,26 @@ def exportar_resumo_fluxo_xlsx(
         ultima_col = get_column_letter(max(ws_classif.max_column, 1))
         ws_classif.auto_filter.ref = f"A{linha_cabecalho_classif}:{ultima_col}{total_linhas_classif}"
 
+    # --------------------------------------------------
+    # ABA 4: BALANCETE (conciliação conta a conta com a F.01 — issue #27)
+    # Incluída quando os dados do Balancete estiverem disponíveis.
+    # --------------------------------------------------
+    aba_balancete_incluida = False
+    if balancete_aba is not None:
+        evid_linhas_bal, linhas_bal, totais_bal = balancete_aba
+        ws_bal = wb.create_sheet(title="Balancete")
+        _preencher_aba_balancete(ws_bal, evid_linhas_bal, linhas_bal, totais_bal)
+        aba_balancete_incluida = True
+
     wb.save(caminho_xlsx)
     logger.info(
-        "Resumo Excel gerado: '%s' (3 abas: Resumo + Conciliação [%s] + Classificado com %d linhas)",
+        "Resumo Excel gerado: '%s' (%d abas: Resumo + Conciliação [%s] + "
+        "Classificado com %d linhas%s)",
         caminho_xlsx,
+        4 if aba_balancete_incluida else 3,
         conciliacao.get("status", "?"),
         total_linhas_classif,
+        " + Balancete" if aba_balancete_incluida else "",
     )
     return caminho_xlsx
 
@@ -3467,24 +3508,42 @@ def _calcular_parametros_f01(data_final: datetime) -> dict:
     """
     Deriva os parâmetros dinâmicos da F.01 a partir do período do sistema.
 
-    Regra (issue #25):
-      - Período ATUAL:      ano = ANO FINAL; mês (low/high) = MÊS FINAL.
-      - Período COMPARATIVO: ano = ANO FINAL - 1; mês (low/high) = "12".
+    Regra (issue #27):
+      - Período ATUAL:       ano = ANO FINAL; mês (low/high) = MÊS FINAL.
+      - Período COMPARATIVO: MÊS IMEDIATAMENTE ANTERIOR ao mês final.
+          * Regra geral: mês final M/AAAA -> comparativo (M-1)/AAAA.
+          * Borda janeiro: mês final 01/AAAA -> comparativo 12/(AAAA-1).
+      - O comparativo depende SEMPRE do mês FINAL do período (independe do
+        mês inicial). Assim, a "Variação no Período" mede a movimentação de UM
+        mês (mês final − mês anterior), que reconcilia com a Movimentação do
+        Razão (Classificado) do mesmo mês.
 
-    Ex.: período 01/04/2026–30/06/2026 -> Atual 2026 / 06-06 ;
-         Comparativo 2025 / 12-12.
+    Ex.: período 01/03/2026–31/03/2026 -> Atual 2026 / 03-03 ; Comparativo 2026 / 02-02.
+         período 01/04/2026–30/06/2026 -> Atual 2026 / 06-06 ; Comparativo 2026 / 05-05.
+         período 01/01/2026–31/01/2026 -> Atual 2026 / 01-01 ; Comparativo 2025 / 12-12.
 
     Retorna dicionário com as chaves usadas pelos campos da tela RFBILA00.
     """
     ano_atual = data_final.year
-    mes_final = f"{data_final.month:02d}"
+    mes_final_num = data_final.month
+    mes_final = f"{mes_final_num:02d}"
+
+    # Comparativo = mês imediatamente anterior ao mês final (borda janeiro -> dez ano anterior)
+    if mes_final_num == 1:
+        ano_comparativo = ano_atual - 1
+        mes_comparativo_num = 12
+    else:
+        ano_comparativo = ano_atual
+        mes_comparativo_num = mes_final_num - 1
+    mes_comparativo = f"{mes_comparativo_num:02d}"
+
     return {
-        "BILBJAHR": str(ano_atual),        # ano final (período atual)
-        "B_MONATE_LOW": mes_final,          # mês final
-        "B_MONATE_HIGH": mes_final,         # mês final
-        "BILVJAHR": str(ano_atual - 1),     # ano final - 1 (comparativo)
-        "V_MONATE_LOW": "12",               # comparativo sempre 12
-        "V_MONATE_HIGH": "12",              # comparativo sempre 12
+        "BILBJAHR": str(ano_atual),          # ano final (período atual)
+        "B_MONATE_LOW": mes_final,            # mês final
+        "B_MONATE_HIGH": mes_final,           # mês final
+        "BILVJAHR": str(ano_comparativo),     # ano do mês anterior (comparativo)
+        "V_MONATE_LOW": mes_comparativo,      # mês imediatamente anterior
+        "V_MONATE_HIGH": mes_comparativo,     # mês imediatamente anterior
     }
 
 
@@ -3712,6 +3771,38 @@ def conciliar_balancete(
     return linhas, totais
 
 
+def _evidencia_linhas(evidencia: dict) -> list:
+    """Constrói o bloco de evidência (rótulo, valor) do Balancete a partir do dict."""
+    return [
+        ("Data emissão", evidencia.get("data_emissao", "")),
+        ("Hora emissão", evidencia.get("hora_emissao", "")),
+        ("Usuário", evidencia.get("usuario", "")),
+        ("Empresa", evidencia.get("empresa", "")),
+        ("Exercício", evidencia.get("exercicio", "")),
+        ("Período consultado", evidencia.get("periodo_atual", "")),
+        ("Período comparativo", evidencia.get("periodo_comparativo", "")),
+    ]
+
+
+def preparar_dados_balancete(
+    arquivo_f01: str, arquivo_classificado: str, logger: logging.Logger
+):
+    """
+    Parseia a F.01, concilia conta a conta com o Razão (Classificado) e devolve
+    os dados prontos para preencher a aba "Balancete" (bloco de evidência,
+    conferência global e tabela). Retorna (evid_linhas, linhas, totais) ou None
+    se a F.01 não existir ou não tiver linhas de detalhe.
+    """
+    if not arquivo_f01 or not os.path.isfile(arquivo_f01):
+        return None
+    evidencia, linhas = parse_f01(arquivo_f01, logger)
+    if not linhas:
+        return None
+    mov_razao = _movimentacao_razao_por_conta(arquivo_classificado, logger)
+    linhas, totais = conciliar_balancete(linhas, mov_razao)
+    return _evidencia_linhas(evidencia), linhas, totais
+
+
 def exportar_balancete(
     evidencia: dict,
     linhas: list,
@@ -3731,15 +3822,7 @@ def exportar_balancete(
     base = f"Balancete_{periodo_nome}"
     caminho_csv = os.path.join(pasta_saida, base + ".csv")
 
-    evid_linhas = [
-        ("Data emissão", evidencia.get("data_emissao", "")),
-        ("Hora emissão", evidencia.get("hora_emissao", "")),
-        ("Usuário", evidencia.get("usuario", "")),
-        ("Empresa", evidencia.get("empresa", "")),
-        ("Exercício", evidencia.get("exercicio", "")),
-        ("Período consultado", evidencia.get("periodo_atual", "")),
-        ("Período comparativo", evidencia.get("periodo_comparativo", "")),
-    ]
+    evid_linhas = _evidencia_linhas(evidencia)
 
     # ---- CSV (utf-8-sig, delimitado por '|') ----
     with open(caminho_csv, "w", encoding="utf-8-sig", newline="") as f:
@@ -3782,24 +3865,17 @@ def exportar_balancete(
     return caminho_csv, caminho_xlsx
 
 
-def _exportar_balancete_xlsx(
-    evid_linhas: list, linhas: list, totais: dict, caminho_xlsx: str,
-    logger: logging.Logger,
-):
-    """Gera a aba "Balancete" formatada. Retorna o caminho ou None."""
-    try:
-        import openpyxl
-        from openpyxl.styles import Alignment, Font, PatternFill
-    except ImportError:
-        logger.error("openpyxl não instalado. Execute: pip install openpyxl")
-        return None
+def _preencher_aba_balancete(ws, evid_linhas: list, linhas: list, totais: dict):
+    """
+    Preenche uma worksheet com o conteúdo do Balancete (bloco de evidência,
+    conferência global e tabela conta a conta), com a formatação de auditoria.
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Balancete"
+    Reutilizada pelo arquivo Balancete_.xlsx separado e pela aba "Balancete"
+    embutida no Resumo_.xlsx. Não salva o workbook.
+    """
+    from openpyxl.styles import Alignment, Font, PatternFill
 
     titulo_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    bloco_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
     ok_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     div_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     fmt_num = '#,##0.00_);[Red](#,##0.00)'
@@ -3873,6 +3949,24 @@ def _exportar_balancete_xlsx(
     for col in ws.columns:
         comprimento = max(len(str(c.value or "")) for c in col)
         ws.column_dimensions[col[0].column_letter].width = min(comprimento + 2, 80)
+
+
+def _exportar_balancete_xlsx(
+    evid_linhas: list, linhas: list, totais: dict, caminho_xlsx: str,
+    logger: logging.Logger,
+):
+    """Gera a aba "Balancete" formatada. Retorna o caminho ou None."""
+    try:
+        import openpyxl
+    except ImportError:
+        logger.error("openpyxl não instalado. Execute: pip install openpyxl")
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Balancete"
+
+    _preencher_aba_balancete(ws, evid_linhas, linhas, totais)
 
     try:
         wb.save(caminho_xlsx)
